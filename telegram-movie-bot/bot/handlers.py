@@ -377,6 +377,46 @@ def register_handlers(
         )
 
     pending_uploads: dict[str, PendingUpload] = {}
+    send_media_lock = asyncio.Lock()
+    last_send_media_ts = 0.0
+
+    async def _run_paced_send_media(coro_factory: Any, min_gap: float = 1.1) -> Any:
+        """Serialize SendMedia calls (copy & reply_photo) with pacing + FloodWait retries."""
+        nonlocal last_send_media_ts
+        async with send_media_lock:
+            for attempt in range(4):
+                elapsed = time.monotonic() - last_send_media_ts
+                if elapsed < min_gap:
+                    await asyncio.sleep(min_gap - elapsed)
+                try:
+                    result = await coro_factory()
+                    last_send_media_ts = time.monotonic()
+                    return result
+                except FloodWait as wait_exc:
+                    wait_secs = float(getattr(wait_exc, "value", 5) or 5) + 1.0
+                    logger.warning(
+                        "Telegram FloodWait during SendMedia (attempt %d/4): sleeping %.1fs",
+                        attempt + 1,
+                        wait_secs,
+                    )
+                    await asyncio.sleep(wait_secs)
+                    last_send_media_ts = time.monotonic()
+            # Final attempt after max FloodWait waits
+            result = await coro_factory()
+            last_send_media_ts = time.monotonic()
+            return result
+
+    async def _run_with_floodwait(coro_factory: Any) -> Any:
+        """Retry non-SendMedia Telegram RPCs on FloodWait without crashing bulk uploads."""
+        for attempt in range(4):
+            try:
+                return await coro_factory()
+            except FloodWait as wait_exc:
+                if attempt == 3:
+                    raise
+                wait_secs = float(getattr(wait_exc, "value", 3) or 3) + 1.0
+                logger.warning("Telegram FloodWait on RPC: sleeping %.1fs", wait_secs)
+                await asyncio.sleep(wait_secs)
 
     def _prune_expired_pending() -> None:
         cutoff = time.monotonic() - 1800  # 30 minutes
@@ -389,14 +429,16 @@ def register_handlers(
         if firebase.is_admin(uid):
             return True
         if message.chat and message.chat.type.name == "PRIVATE":
-            await message.reply_text(
-                "⛔ **Access Denied**\nOnly authorized admins can use this bot.",
-                quote=True,
+            await _run_with_floodwait(
+                lambda: message.reply_text(
+                    "⛔ **Access Denied**\nOnly authorized admins can use this bot.",
+                    quote=True,
+                )
             )
         return False
 
     async def _copy_to_storage(msg: Message) -> tuple[str, int]:
-        """Copy media message into STORAGE_CHANNEL_ID and return `(file_id, storage_msg_id)`."""
+        """Copy media message into STORAGE_CHANNEL_ID cleanly without triggering FloodWait storms."""
         media = msg.video or msg.document
         file_id = getattr(media, "file_id", "") if media else ""
 
@@ -404,11 +446,9 @@ def register_handlers(
             return file_id, msg.id
 
         try:
-            copied = await msg.copy(settings.storage_channel_id)
-            return file_id, copied.id
-        except FloodWait as wait_exc:
-            await asyncio.sleep(wait_exc.value)
-            copied = await msg.copy(settings.storage_channel_id)
+            copied = await _run_paced_send_media(
+                lambda: msg.copy(settings.storage_channel_id)
+            )
             return file_id, copied.id
         except RPCError as exc:
             logger.warning(
@@ -490,11 +530,13 @@ def register_handlers(
 
         if reply_target and record["posterUrl"].startswith(("http://", "https://")):
             try:
-                await reply_target.reply_photo(
-                    photo=record["posterUrl"],
-                    caption=text[:1024],
-                    reply_markup=keyboard,
-                    quote=True,
+                await _run_paced_send_media(
+                    lambda: reply_target.reply_photo(
+                        photo=record["posterUrl"],
+                        caption=text[:1024],
+                        reply_markup=keyboard,
+                        quote=True,
+                    )
                 )
                 if status_msg:
                     try:
@@ -506,11 +548,16 @@ def register_handlers(
                 logger.debug("reply_photo fallback to text confirmation: %s", exc)
 
         if status_msg:
-            await status_msg.edit_text(
-                text,
-                reply_markup=keyboard,
-                disable_web_page_preview=False,
-            )
+            try:
+                await _run_with_floodwait(
+                    lambda: status_msg.edit_text(
+                        text,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=False,
+                    )
+                )
+            except RPCError as exc:
+                logger.warning("Failed to edit confirmation status message: %s", exc)
 
     async def _send_user_download_card(message: Message, firebase_key: str) -> None:
         try:
@@ -813,10 +860,15 @@ def register_handlers(
 
         status_msg: Optional[Message] = None
         if reply_target and not silent_channel_mode:
-            status_msg = await reply_target.reply_text(
-                f"🔎 Parsing `{parsed.title}`{f' ({parsed.year})' if parsed.year else ''} & fetching TMDB metadata...",
-                quote=True,
-            )
+            try:
+                status_msg = await _run_with_floodwait(
+                    lambda: reply_target.reply_text(
+                        f"🔎 Parsing `{parsed.title}`{f' ({parsed.year})' if parsed.year else ''} & fetching TMDB metadata...",
+                        quote=True,
+                    )
+                )
+            except RPCError as exc:
+                logger.warning("Could not send parsing status message: %s", exc)
 
         tmdb_meta = await tmdb.lookup(
             parsed.title,

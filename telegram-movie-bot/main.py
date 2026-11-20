@@ -72,6 +72,7 @@ async def run_bot() -> None:
         in_memory=True,
         workers=16,
         max_concurrent_transmissions=8,
+        sleep_threshold=30,
     )
     register_handlers(
         app=tg_client,
