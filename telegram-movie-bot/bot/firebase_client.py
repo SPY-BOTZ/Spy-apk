@@ -179,6 +179,77 @@ class FirebaseClient:
         result = await self._request("GET", f"movies/{firebase_key}")
         return result if isinstance(result, dict) else None
 
+    async def get_sample_movies(self, *, from_start: bool = True, limit: int = 3) -> dict[str, dict[str, Any]]:
+        """Fetch a few existing `/movies` records using `$key` ordering."""
+        param_key = "limitToFirst" if from_start else "limitToLast"
+        result = await self._request(
+            "GET",
+            "movies",
+            extra_params={"orderBy": '"$key"', param_key: str(limit)},
+        )
+        if not isinstance(result, dict):
+            return {}
+        return {str(k): v for k, v in result.items() if isinstance(v, dict)}
+
+    async def detect_schema_profile(self, force_refresh: bool = False) -> dict[str, Any]:
+        """Inspect an existing movie record in `/movies` to match exact field types & keys."""
+        if not force_refresh and hasattr(self, "_schema_cache") and self._schema_cache is not None:
+            return self._schema_cache
+
+        samples = await self.get_sample_movies(from_start=True, limit=3)
+        profile: dict[str, Any] = {
+            "has_sample": False,
+            "sample_keys": [],
+            "createdAt_type": "int_ms",
+            "year_type": "str",
+            "rating_type": "float",
+            "messageId_type": "int",
+            "sample_status": None,
+        }
+
+        for _, item in samples.items():
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            profile["has_sample"] = True
+            profile["sample_keys"] = sorted(item.keys())
+
+            created_val = item.get("createdAt")
+            if isinstance(created_val, bool):
+                profile["createdAt_type"] = "int_ms"
+            elif isinstance(created_val, (int, float)):
+                profile["createdAt_type"] = "int_ms" if created_val > 10**11 else "int_sec"
+            elif isinstance(created_val, str):
+                profile["createdAt_type"] = "iso_str"
+
+            if "year" in item:
+                profile["year_type"] = "int" if isinstance(item["year"], int) else "str"
+            if "rating" in item:
+                profile["rating_type"] = "str" if isinstance(item["rating"], str) else "float"
+            if "messageId" in item:
+                profile["messageId_type"] = "str" if isinstance(item["messageId"], str) else "int"
+            if isinstance(item.get("status"), str):
+                profile["sample_status"] = item["status"]
+            break
+
+        self._schema_cache = profile
+        return profile
+
+    async def inspect_database(self) -> dict[str, Any]:
+        """Return root nodes, `/movies` count, schema profile, and latest/oldest sample keys."""
+        root_shallow = await self._request("GET", "", extra_params={"shallow": "true"})
+        root_nodes = sorted(root_shallow.keys()) if isinstance(root_shallow, dict) else []
+        movie_count = await self.count_movies()
+        profile = await self.detect_schema_profile(force_refresh=True)
+        oldest = await self.get_sample_movies(from_start=True, limit=1)
+        newest = await self.get_sample_movies(from_start=False, limit=2)
+        return {
+            "root_nodes": root_nodes,
+            "movie_count": movie_count,
+            "profile": profile,
+            "oldest": oldest,
+            "newest": newest,
+        }
+
     async def count_movies(self) -> int:
         """Count total records under `/movies` using shallow query."""
         result = await self._request("GET", "movies", extra_params={"shallow": "true"})

@@ -83,8 +83,9 @@ def build_movie_record(
     message_id: int,
     base_url: str,
     direct_url: Optional[str] = None,
+    schema_profile: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Build the Firebase `/movies` schema record."""
+    """Build the Firebase `/movies` schema record aligned with existing DB types."""
     if direct_url:
         watch_url = direct_url
         download_url = direct_url
@@ -100,12 +101,32 @@ def build_movie_record(
     download780 = download_url if quality == "720p" else ""
     download1080 = download_url if quality in ("1080p", "4K") else ""
 
-    return {
+    profile = schema_profile or {}
+    created_mode = profile.get("createdAt_type", "int_ms")
+    now_ms = int(time.time() * 1000)
+    if created_mode == "iso_str":
+        created_at: Any = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    elif created_mode == "int_sec":
+        created_at = int(time.time())
+    else:
+        created_at = now_ms
+
+    year_val: Any = tmdb.year
+    if profile.get("year_type") == "int" and str(tmdb.year).isdigit():
+        year_val = int(tmdb.year)
+
+    rating_val: Any = tmdb.rating
+    if profile.get("rating_type") == "str":
+        rating_val = str(tmdb.rating)
+
+    msg_id_val: Any = str(message_id) if profile.get("messageId_type") == "str" else message_id
+
+    record: dict[str, Any] = {
         "title": tmdb.title,
-        "year": tmdb.year,
+        "year": year_val,
         "posterUrl": tmdb.poster_url,
         "category": tmdb.category,
-        "rating": tmdb.rating,
+        "rating": rating_val,
         "qualityBadge": _quality_badge(quality),
         "language": language,
         "quality": quality,
@@ -119,9 +140,39 @@ def build_movie_record(
         "download1080": download1080,
         "downloadLink": download_url,
         "fileId": file_id,
-        "messageId": message_id,
-        "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "messageId": msg_id_val,
+        "createdAt": created_at,
     }
+
+    sample_keys = set(profile.get("sample_keys") or [])
+    if "watch720" in sample_keys:
+        record["watch720"] = watch780
+    if "download720" in sample_keys:
+        record["download720"] = download780
+    if "timestamp" in sample_keys:
+        record["timestamp"] = now_ms
+    if "poster" in sample_keys:
+        record["poster"] = tmdb.poster_url
+    if "image" in sample_keys:
+        record["image"] = tmdb.poster_url
+    if "thumbnail" in sample_keys:
+        record["thumbnail"] = tmdb.poster_url
+    if "thumb" in sample_keys:
+        record["thumb"] = tmdb.poster_url
+    if "overview" in sample_keys:
+        record["overview"] = tmdb.description
+    if "plot" in sample_keys:
+        record["plot"] = tmdb.description
+    if "genre" in sample_keys:
+        record["genre"] = tmdb.category
+    if "views" in sample_keys:
+        record["views"] = 0
+    if "type" in sample_keys:
+        record["type"] = "series" if tmdb.media_type == "tv" else "movie"
+    if "status" in sample_keys and profile.get("sample_status"):
+        record["status"] = profile["sample_status"]
+
+    return record
 
 
 def _build_selection_keyboard(pending: PendingUpload) -> InlineKeyboardMarkup:
@@ -295,6 +346,11 @@ def register_handlers(
                 matched=tmdb_meta.matched,
             )
 
+        try:
+            schema_profile = await firebase.detect_schema_profile()
+        except FirebaseError:
+            schema_profile = None
+
         record = build_movie_record(
             tmdb=tmdb_meta,
             language=language,
@@ -303,9 +359,13 @@ def register_handlers(
             message_id=message_id,
             base_url=settings.base_url,
             direct_url=direct_url,
+            schema_profile=schema_profile,
         )
         try:
             firebase_key = await firebase.push_movie(record)
+            sample_keys = set((schema_profile or {}).get("sample_keys") or [])
+            if "id" in sample_keys:
+                await firebase.update_movie(firebase_key, {"id": firebase_key})
         except FirebaseError as exc:
             logger.error("Firebase push failed: %s", exc)
             if status_msg:
@@ -361,10 +421,54 @@ def register_handlers(
             f"**Admin Commands:**\n"
             f"• Send or forward any video/document file or link to auto-catalog to Firebase\n"
             f"• `/status` — Bot, Firebase, TMDB & Koyeb server health\n"
+            f"• `/inspectdb` — Check Firebase nodes, movie count & APK schema types\n"
             f"• `/addadmin <user_id>` (or reply) — Authorize an admin\n"
             f"• `/removeadmin <user_id>` (or reply) — Revoke an admin\n"
             f"• `/admins` or `/adminlist` — List authorized admins",
             quote=True,
+        )
+
+    # ------------------------------------------------------------------
+    # /inspectdb
+    # ------------------------------------------------------------------
+
+    @app.on_message(filters.command(["inspectdb"]))
+    async def cmd_inspectdb(client: Client, message: Message) -> None:
+        if not await _require_admin(message):
+            return
+
+        msg = await message.reply_text("🔎 Inspecting Firebase database schema...", quote=True)
+        try:
+            info = await firebase.inspect_database()
+        except FirebaseError as exc:
+            await msg.edit_text(f"❌ Firebase inspection failed: `{exc}`")
+            return
+
+        profile = info["profile"]
+        nodes_text = ", ".join(f"`/{n}`" for n in info["root_nodes"]) or "None"
+        sample_keys = ", ".join(profile.get("sample_keys") or []) or "Empty"
+
+        oldest_lines: list[str] = []
+        for k, v in info["oldest"].items():
+            oldest_lines.append(
+                f"• `{k}`: `{v.get('title')}` (createdAt={type(v.get('createdAt')).__name__}:{v.get('createdAt')})"
+            )
+        newest_lines: list[str] = []
+        for k, v in info["newest"].items():
+            newest_lines.append(
+                f"• `{k}`: `{v.get('title')}` (createdAt={type(v.get('createdAt')).__name__}:{v.get('createdAt')})"
+            )
+
+        await msg.edit_text(
+            f"🗄 **Firebase DB Inspection**\n\n"
+            f"🌐 **DB URL:** `{settings.firebase_db_url}`\n"
+            f"📁 **Root Nodes:** {nodes_text}\n"
+            f"🎬 **/movies Count:** `{info['movie_count']}`\n"
+            f"🧬 **Detected Types:** `createdAt={profile.get('createdAt_type')}`, "
+            f"`year={profile.get('year_type')}`, `rating={profile.get('rating_type')}`\n"
+            f"🔑 **Existing Keys:** `{sample_keys}`\n\n"
+            f"**Oldest Sample:**\n" + ("\n".join(oldest_lines) or "• None") + "\n\n"
+            f"**Newest Samples:**\n" + ("\n".join(newest_lines) or "• None")
         )
 
     # ------------------------------------------------------------------
@@ -593,7 +697,7 @@ def register_handlers(
 
     @app.on_message(
         filters.text
-        & ~filters.command(["start", "help", "status", "addadmin", "removeadmin", "admins", "adminlist"])
+        & ~filters.command(["start", "help", "status", "inspectdb", "addadmin", "removeadmin", "admins", "adminlist"])
     )
     async def handle_link_upload(client: Client, message: Message) -> None:
         text = (message.text or "").strip()
