@@ -166,5 +166,24 @@ class LinkGeneratorTests(unittest.TestCase):
         self.assertEqual(sanitize_download_filename("no_ext", 9), "no_ext.mp4")
 
 
+class ApkLanguageFormattingTests(unittest.TestCase):
+    def test_badge_and_description_prefix_without_duplication(self) -> None:
+        from bot.handlers import format_apk_badge, format_apk_description
+
+        self.assertEqual(format_apk_badge("Multi", "480p"), "Multi • 480p • SD")
+        desc1 = format_apk_description("After his father is murdered...", "Multi", "480p")
+        self.assertTrue(desc1.startswith("🌐 Language: Multi | 🎞 Quality: 480p (SD)\n\n"))
+
+        desc2 = format_apk_description(desc1, "Hindi", "720p")
+        self.assertEqual(
+            desc2,
+            "🌐 Language: Hindi | 🎞 Quality: 720p (HD)\n\nAfter his father is murdered...",
+        )
+        self.assertEqual(
+            format_apk_description("No description available.", "Hindi", "720p"),
+            "🌐 Language: Hindi | 🎞 Quality: 720p (HD)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

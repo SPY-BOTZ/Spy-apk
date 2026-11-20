@@ -153,6 +153,7 @@ export function buildFirebasePayloadPreview(params: {
   const cleanBase = params.baseUrl.replace(/\/+$/, '') || 'https://your-app.koyeb.app';
   const watchUrl = `${cleanBase}/watch/${params.messageId}`;
   const downloadUrl = `${cleanBase}/download/${params.messageId}`;
+  const shortBadge = qualityBadgeFor(params.quality);
 
   return {
     title: params.title,
@@ -160,11 +161,11 @@ export function buildFirebasePayloadPreview(params: {
     posterUrl: 'https://image.tmdb.org/t/p/w500/example_poster.jpg',
     category: params.isSeries ? 'Web Series' : 'Sci-Fi',
     rating: 8.4,
-    qualityBadge: qualityBadgeFor(params.quality),
+    qualityBadge: `${params.language} • ${params.quality} • ${shortBadge}`,
     language: params.language,
     quality: params.quality,
     cast: 'Actor One, Actor Two, Actor Three',
-    description: 'Overview retrieved automatically from TMDB v3 API.',
+    description: `🌐 Language: ${params.language} | 🎞 Quality: ${params.quality} (${shortBadge})\n\nOverview retrieved automatically from TMDB v3 API.`,
     watch480: params.quality === '480p' ? watchUrl : '',
     watch780: params.quality === '720p' ? watchUrl : '',
     watch1080: params.quality === '1080p' || params.quality === '4K' ? watchUrl : '',

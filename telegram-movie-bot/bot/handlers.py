@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -66,6 +67,9 @@ def _format_uptime(seconds: float) -> str:
     return " ".join(parts)
 
 
+_LANG_HEADER_RE = re.compile(r"^🌐\s*Language:[^\n]*(?:\n\n|\n)?")
+
+
 def _quality_badge(quality: str) -> str:
     return {
         "480p": "SD",
@@ -73,6 +77,22 @@ def _quality_badge(quality: str) -> str:
         "1080p": "FHD",
         "4K": "4K",
     }.get(quality, "HD")
+
+
+def format_apk_badge(language: str, quality: str) -> str:
+    """Format poster card badge so APK users immediately see Language + Quality."""
+    return f"{language} • {quality} • {_quality_badge(quality)}"
+
+
+def format_apk_description(base_description: str, language: str, quality: str) -> str:
+    """Prefix Language & Quality at the top of description right under movie title in the APK."""
+    clean_desc = _LANG_HEADER_RE.sub("", (base_description or "").strip()).strip()
+    if clean_desc == "No description available.":
+        clean_desc = ""
+    header = f"🌐 Language: {language} | 🎞 Quality: {quality} ({_quality_badge(quality)})"
+    if not clean_desc:
+        return header
+    return f"{header}\n\n{clean_desc}"
 
 
 def build_movie_record(
@@ -137,7 +157,8 @@ def build_movie_record(
         if profile.get("cast_type") == "list"
         else ", ".join(tmdb.cast)
     )
-    badge_val = _quality_badge(quality)
+    badge_val = format_apk_badge(language, quality)
+    formatted_desc = format_apk_description(tmdb.description, language, quality)
 
     record: dict[str, Any] = {
         "title": tmdb.title,
@@ -149,7 +170,7 @@ def build_movie_record(
         "language": language,
         "quality": quality,
         "cast": cast_val,
-        "description": tmdb.description,
+        "description": formatted_desc,
         "watch480": watch480,
         "watch780": watch780,
         "watch1080": watch1080,
@@ -189,9 +210,9 @@ def build_movie_record(
     if "thumb" in sample_keys:
         record["thumb"] = tmdb.poster_url
     if "overview" in sample_keys:
-        record["overview"] = tmdb.description
+        record["overview"] = formatted_desc
     if "plot" in sample_keys:
-        record["plot"] = tmdb.description
+        record["plot"] = formatted_desc
     if "genre" in sample_keys:
         record["genre"] = tmdb.category
     if "views" in sample_keys:
@@ -314,19 +335,21 @@ def _format_confirmation_text(
 ) -> str:
     year_part = f" ({record['year']})" if record["year"] else ""
     tmdb_note = "Matched via TMDB" if tmdb_matched else "Fallback metadata (TMDB no match)"
-    desc = str(record.get("description", ""))
+    raw_desc = str(record.get("description", ""))
+    desc = _LANG_HEADER_RE.sub("", raw_desc).strip() or raw_desc
     if len(desc) > 160:
         desc = f"{desc[:157]}..."
 
     cast_raw = record.get("cast")
     cast_str = ", ".join(cast_raw) if isinstance(cast_raw, list) else str(cast_raw or "")
     cast_line = f"🎭 **Cast:** {cast_str}\n" if cast_str else ""
+    short_badge = _quality_badge(str(record.get("quality", "720p")))
 
     return (
         f"✅ **Cataloged to Firebase**\n\n"
         f"🎬 **Title:** {record['title']}{year_part}\n"
         f"🏷 **Category:** {record['category']} | ⭐ **Rating:** {record['rating']}\n"
-        f"🌐 **Language:** {record['language']} | 🎞 **Quality:** {record['quality']} ({record['qualityBadge']})\n"
+        f"🌐 **Language:** {record['language']} | 🎞 **Quality:** {record['quality']} ({short_badge})\n"
         f"{cast_line}"
         f"📝 **Plot:** {desc}\n"
         f"🔑 **Firebase Key:** `{firebase_key}`\n"
@@ -411,13 +434,12 @@ def register_handlers(
         send_confirmation: bool = True,
     ) -> None:
         if tmdb_meta.description == "No description available.":
-            year_suffix = f" ({tmdb_meta.year})" if tmdb_meta.year else ""
             tmdb_meta = TmdbMetadata(
                 title=tmdb_meta.title,
                 year=tmdb_meta.year,
                 poster_url=tmdb_meta.poster_url,
                 rating=tmdb_meta.rating,
-                description=f"{tmdb_meta.title}{year_suffix} — {language} ({quality})",
+                description="",
                 category=tmdb_meta.category,
                 original_language=tmdb_meta.original_language,
                 tmdb_id=tmdb_meta.tmdb_id,
@@ -986,25 +1008,49 @@ def register_handlers(
                 return
 
             patch: dict[str, Any] = {}
+            current_lang = str(existing.get("language") or "Hindi")
+            current_qual = str(existing.get("quality") or "720p")
+            existing_desc = str(existing.get("description") or "")
+
             if action == "upd_lang":
-                patch["language"] = new_value
+                current_lang = new_value
+                updated_badge = format_apk_badge(current_lang, current_qual)
+                updated_desc = format_apk_description(existing_desc, current_lang, current_qual)
+                patch = {
+                    "language": current_lang,
+                    "qualityBadge": updated_badge,
+                    "description": updated_desc,
+                }
             else:
+                current_qual = new_value
+                updated_badge = format_apk_badge(current_lang, current_qual)
+                updated_desc = format_apk_description(existing_desc, current_lang, current_qual)
                 watch_url = existing.get("watchLink", "")
                 download_url = existing.get("downloadLink", "")
                 patch = {
-                    "quality": new_value,
-                    "qualityBadge": _quality_badge(new_value),
-                    "watch480": watch_url if new_value == "480p" else "",
-                    "watch780": watch_url if new_value == "720p" else "",
-                    "watch1080": watch_url if new_value in ("1080p", "4K") else "",
-                    "download480": download_url if new_value == "480p" else "",
-                    "download780": download_url if new_value == "720p" else "",
-                    "download1080": download_url if new_value in ("1080p", "4K") else "",
+                    "quality": current_qual,
+                    "qualityBadge": updated_badge,
+                    "description": updated_desc,
+                    "watch480": watch_url if current_qual == "480p" else "",
+                    "watch780": watch_url if current_qual == "720p" else "",
+                    "watch1080": watch_url if current_qual in ("1080p", "4K") else "",
+                    "download480": download_url if current_qual == "480p" else "",
+                    "download780": download_url if current_qual == "720p" else "",
+                    "download1080": download_url if current_qual in ("1080p", "4K") else "",
                 }
                 if "download720" in existing:
-                    patch["download720"] = download_url if new_value == "720p" else ""
+                    patch["download720"] = download_url if current_qual == "720p" else ""
                 if "watch720" in existing:
-                    patch["watch720"] = watch_url if new_value == "720p" else ""
+                    patch["watch720"] = watch_url if current_qual == "720p" else ""
+
+            if "cardBadge" in existing:
+                patch["cardBadge"] = updated_badge
+            if "badge" in existing:
+                patch["badge"] = updated_badge
+            if "overview" in existing:
+                patch["overview"] = updated_desc
+            if "plot" in existing:
+                patch["plot"] = updated_desc
 
             try:
                 await firebase.update_movie(firebase_key, patch)

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Check, Copy, Download, FileCode2, FolderTree, Search } from 'lucide-react';
+import { Check, Copy, Download, FileCode2, FolderTree, Languages, Search } from 'lucide-react';
 import { BOT_FILES, type BotFileEntry } from './lib/botFiles';
 import {
   SUPPORTED_LANGUAGES,
@@ -9,6 +9,8 @@ import {
 } from './lib/mediaParser';
 
 type WorkspaceTab = 'files' | 'simulator' | 'deploy';
+
+const COMMON_TOGGLE_LANGUAGES = ['Hindi', 'English', 'Tamil', 'Telugu', 'Malayalam'] as const;
 
 const PRESET_SAMPLES = [
   {
@@ -171,6 +173,29 @@ export default function App() {
 
   const toggleStep = (id: string) => {
     setCompletedSteps((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const handleCycleCommonLanguage = () => {
+    if (overrideLanguage === null) {
+      const currentIdx = COMMON_TOGGLE_LANGUAGES.indexOf(
+        effectiveLanguage as (typeof COMMON_TOGGLE_LANGUAGES)[number]
+      );
+      const nextLang =
+        currentIdx === -1
+          ? COMMON_TOGGLE_LANGUAGES[0]
+          : COMMON_TOGGLE_LANGUAGES[(currentIdx + 1) % COMMON_TOGGLE_LANGUAGES.length];
+      setOverrideLanguage(nextLang);
+      return;
+    }
+
+    const idx = COMMON_TOGGLE_LANGUAGES.indexOf(
+      overrideLanguage as (typeof COMMON_TOGGLE_LANGUAGES)[number]
+    );
+    if (idx === -1 || idx === COMMON_TOGGLE_LANGUAGES.length - 1) {
+      setOverrideLanguage(null);
+      return;
+    }
+    setOverrideLanguage(COMMON_TOGGLE_LANGUAGES[idx + 1]);
   };
 
   const fileLines = useMemo(() => selectedFile.content.split('\n'), [selectedFile]);
@@ -486,7 +511,9 @@ export default function App() {
                         <button
                           key={lang}
                           type="button"
-                          onClick={() => setOverrideLanguage(lang)}
+                          onClick={() =>
+                            setOverrideLanguage((prev) => (prev === lang ? null : lang))
+                          }
                           className={`px-3 py-2 text-xs font-medium rounded-md border transition-colors ${
                             active
                               ? 'bg-slate-900 text-white border-slate-900'
@@ -568,11 +595,62 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="px-6 py-4 border-b border-slate-200 grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
-                <div>
-                  <span className="block text-slate-500">Clean Title</span>
-                  <span className="font-semibold text-slate-900">{parsedPreview.title}</span>
+              <div className="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 bg-slate-50/60">
+                <div className="flex flex-wrap items-center gap-2.5 min-w-0">
+                  <div>
+                    <span className="block text-[11px] text-slate-500">Clean Title</span>
+                    <span className="text-sm font-semibold text-slate-900">
+                      {parsedPreview.title}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCycleCommonLanguage}
+                    title="Click to cycle common languages or revert to auto-detect"
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap ${
+                      overrideLanguage === null
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
+                        : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100'
+                    }`}
+                  >
+                    <Languages className="w-3.5 h-3.5 shrink-0" />
+                    <span>Auto-Detect Language:</span>
+                    <span className="font-semibold">{effectiveLanguage}</span>
+                    <span className="text-[11px] opacity-75">
+                      ({overrideLanguage === null ? 'Auto' : 'Manual'})
+                    </span>
+                  </button>
                 </div>
+
+                <div
+                  className="flex flex-wrap items-center gap-1.5"
+                  role="group"
+                  aria-label="One-click common language toggles"
+                >
+                  {COMMON_TOGGLE_LANGUAGES.map((lang) => {
+                    const active = effectiveLanguage === lang;
+                    return (
+                      <button
+                        key={lang}
+                        type="button"
+                        onClick={() =>
+                          setOverrideLanguage((prev) => (prev === lang ? null : lang))
+                        }
+                        aria-pressed={active}
+                        className={`px-2.5 py-1 text-[11px] font-medium rounded border transition-colors ${
+                          active
+                            ? 'bg-slate-900 text-white border-slate-900'
+                            : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100 hover:text-slate-900'
+                        }`}
+                      >
+                        {lang}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="px-6 py-4 border-b border-slate-200 grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
                 <div>
                   <span className="block text-slate-500">Year</span>
                   <span className="font-semibold text-slate-900 tabular-nums">
@@ -586,9 +664,13 @@ export default function App() {
                   </span>
                 </div>
                 <div>
+                  <span className="block text-slate-500">Language</span>
+                  <span className="font-semibold text-slate-900">{effectiveLanguage}</span>
+                </div>
+                <div>
                   <span className="block text-slate-500">Quality Badge</span>
                   <span className="font-semibold text-slate-900">
-                    {effectiveQuality} / {firebaseRecord.qualityBadge}
+                    {firebaseRecord.qualityBadge}
                   </span>
                 </div>
               </div>
