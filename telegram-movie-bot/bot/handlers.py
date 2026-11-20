@@ -121,15 +121,23 @@ def build_movie_record(
 
     msg_id_val: Any = str(message_id) if profile.get("messageId_type") == "str" else message_id
 
+    cast_val: Any = (
+        list(tmdb.cast)
+        if profile.get("cast_type") == "list"
+        else ", ".join(tmdb.cast)
+    )
+    badge_val = _quality_badge(quality)
+
     record: dict[str, Any] = {
         "title": tmdb.title,
         "year": year_val,
         "posterUrl": tmdb.poster_url,
         "category": tmdb.category,
         "rating": rating_val,
-        "qualityBadge": _quality_badge(quality),
+        "qualityBadge": badge_val,
         "language": language,
         "quality": quality,
+        "cast": cast_val,
         "description": tmdb.description,
         "watch480": watch480,
         "watch780": watch780,
@@ -145,6 +153,16 @@ def build_movie_record(
     }
 
     sample_keys = set(profile.get("sample_keys") or [])
+    if "cardBadge" in sample_keys:
+        record["cardBadge"] = badge_val
+    if "badge" in sample_keys:
+        record["badge"] = badge_val
+    if "genres" in sample_keys:
+        record["genres"] = (
+            list(tmdb.genres or [tmdb.category])
+            if profile.get("genres_type") == "list"
+            else ", ".join(tmdb.genres or [tmdb.category])
+        )
     if "watch720" in sample_keys:
         record["watch720"] = watch780
     if "download720" in sample_keys:
@@ -203,23 +221,42 @@ def _build_selection_keyboard(pending: PendingUpload) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _infer_quality_from_message(msg: Optional[Message]) -> Optional[str]:
-    """Detect quality from Telegram video height/width metadata when filename lacks resolution."""
+def _infer_quality_from_message(msg: Optional[Message], is_series: bool = False) -> Optional[str]:
+    """Detect quality from Telegram video resolution or file size when filename lacks tags."""
     if not msg:
         return None
     video = getattr(msg, "video", None)
-    if not video:
-        return None
-    height = int(getattr(video, "height", 0) or 0)
-    width = int(getattr(video, "width", 0) or 0)
-    dim = max(height, round(width * 9 / 16)) if (height or width) else 0
-    if dim >= 2000:
-        return "4K"
-    if dim >= 1000:
-        return "1080p"
-    if dim >= 680:
-        return "720p"
-    if dim > 0:
+    if video:
+        height = int(getattr(video, "height", 0) or 0)
+        width = int(getattr(video, "width", 0) or 0)
+        dim = max(height, round(width * 9 / 16)) if (height or width) else 0
+        if dim >= 2000:
+            return "4K"
+        if dim >= 1000:
+            return "1080p"
+        if dim >= 680:
+            return "720p"
+        if dim > 0:
+            return "480p"
+
+    media = video or getattr(msg, "document", None)
+    size_bytes = int(getattr(media, "file_size", 0) or 0) if media else 0
+    if size_bytes > 0:
+        size_mb = size_bytes / (1024 * 1024)
+        if is_series:
+            if size_mb >= 1800:
+                return "4K"
+            if size_mb >= 650:
+                return "1080p"
+            if size_mb >= 250:
+                return "720p"
+            return "480p"
+        if size_mb >= 3500:
+            return "4K"
+        if size_mb >= 1400:
+            return "1080p"
+        if size_mb >= 600:
+            return "720p"
         return "480p"
     return None
 
@@ -249,20 +286,24 @@ def _format_confirmation_text(
     year_part = f" ({record['year']})" if record["year"] else ""
     tmdb_note = "Matched via TMDB" if tmdb_matched else "Fallback metadata (TMDB no match)"
     desc = str(record.get("description", ""))
-    if len(desc) > 180:
-        desc = f"{desc[:177]}..."
+    if len(desc) > 160:
+        desc = f"{desc[:157]}..."
+
+    cast_raw = record.get("cast")
+    cast_str = ", ".join(cast_raw) if isinstance(cast_raw, list) else str(cast_raw or "")
+    cast_line = f"🎭 **Cast:** {cast_str}\n" if cast_str else ""
 
     return (
         f"✅ **Cataloged to Firebase**\n\n"
         f"🎬 **Title:** {record['title']}{year_part}\n"
         f"🏷 **Category:** {record['category']} | ⭐ **Rating:** {record['rating']}\n"
         f"🌐 **Language:** {record['language']} | 🎞 **Quality:** {record['quality']} ({record['qualityBadge']})\n"
-        f"🖼 **Poster:** {record['posterUrl']}\n"
+        f"{cast_line}"
         f"📝 **Plot:** {desc}\n"
         f"🔑 **Firebase Key:** `{firebase_key}`\n"
         f"📦 **Message ID:** `{record['messageId']}`\n"
         f"📡 **Metadata:** {tmdb_note}\n\n"
-        f"_Tap a Language or Quality button below to adjust this entry anytime._"
+        f"Tap a Language or Quality button below to adjust this entry anytime."
     )
 
 
@@ -647,7 +688,7 @@ def register_handlers(
         resolved_language = parsed.language or tmdb_meta.original_language or "Hindi"
         resolved_quality = (
             parsed.quality
-            or _infer_quality_from_message(media_message)
+            or _infer_quality_from_message(media_message, is_series=parsed.is_series)
             or "720p"
         )
 

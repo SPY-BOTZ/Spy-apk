@@ -163,6 +163,7 @@ export function buildFirebasePayloadPreview(params: {
     qualityBadge: qualityBadgeFor(params.quality),
     language: params.language,
     quality: params.quality,
+    cast: 'Actor One, Actor Two, Actor Three',
     description: 'Overview retrieved automatically from TMDB v3 API.',
     watch480: params.quality === '480p' ? watchUrl : '',
     watch780: params.quality === '720p' ? watchUrl : '',
@@ -174,6 +175,6 @@ export function buildFirebasePayloadPreview(params: {
     downloadLink: downloadUrl,
     fileId: 'BAACAgUAAxkBAAIB...',
     messageId: params.messageId,
-    createdAt: new Date().toISOString(),
+    createdAt: Date.now(),
   };
 }

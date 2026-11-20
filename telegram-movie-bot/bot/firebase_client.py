@@ -204,6 +204,8 @@ class FirebaseClient:
             "year_type": "str",
             "rating_type": "float",
             "messageId_type": "int",
+            "cast_type": "str",
+            "genres_type": "list",
             "sample_status": None,
         }
 
@@ -227,6 +229,10 @@ class FirebaseClient:
                 profile["rating_type"] = "str" if isinstance(item["rating"], str) else "float"
             if "messageId" in item:
                 profile["messageId_type"] = "str" if isinstance(item["messageId"], str) else "int"
+            if "cast" in item:
+                profile["cast_type"] = "list" if isinstance(item["cast"], list) else "str"
+            if "genres" in item:
+                profile["genres_type"] = "list" if isinstance(item["genres"], list) else "str"
             if isinstance(item.get("status"), str):
                 profile["sample_status"] = item["status"]
             break

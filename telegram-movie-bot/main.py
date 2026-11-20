@@ -63,6 +63,8 @@ async def run_bot() -> None:
         api_hash=settings.api_hash,
         bot_token=settings.bot_token,
         in_memory=True,
+        workers=16,
+        max_concurrent_transmissions=8,
     )
     register_handlers(
         app=tg_client,

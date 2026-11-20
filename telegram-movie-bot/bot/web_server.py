@@ -1,12 +1,14 @@
-"""Koyeb-compatible async HTTP health and Telegram media streaming server."""
+"""Koyeb-compatible async HTTP health, branded watch player, and fast range-streaming server."""
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import mimetypes
 import re
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from aiohttp import web
@@ -16,8 +18,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_CHUNK_SIZE = 1024 * 1024  # Pyrogram stream_media streams in 1 MiB chunks
+TELEGRAM_CHUNK_SIZE = 1024 * 1024  # Pyrogram stream_media yields 1 MiB chunks
+PREFETCH_QUEUE_CHUNKS = 8
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "spy_movie_botz_logo.png"
 
 
 def _extract_media_meta(message: Any) -> tuple[Optional[str], int, str]:
@@ -36,8 +41,19 @@ def _extract_media_meta(message: Any) -> tuple[Optional[str], int, str]:
     return file_name, file_size, mime_type
 
 
+def _format_size(size_bytes: int) -> str:
+    if size_bytes <= 0:
+        return ""
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.2f} {unit}" if unit in ("GB", "TB") else f"{size:.0f} {unit}"
+        size /= 1024
+    return ""
+
+
 class BotWebServer:
-    """Async aiohttp server providing Koyeb health endpoints and optional range streaming."""
+    """Async aiohttp server providing Koyeb health endpoints and fast byte-range streaming."""
 
     def __init__(
         self,
@@ -60,9 +76,12 @@ class BotWebServer:
     def _register_routes(self) -> None:
         self._app.router.add_get("/", self.handle_root)
         self._app.router.add_get("/health", self.handle_health)
+        self._app.router.add_get("/assets/logo.png", self.handle_logo)
         self._app.router.add_get("/watch/{message_id}", self.handle_watch_page)
-        self._app.router.add_get("/stream/{message_id}", self.handle_stream)
-        self._app.router.add_get("/download/{message_id}", self.handle_download)
+        self._app.router.add_route("GET", "/stream/{message_id}", self.handle_stream)
+        self._app.router.add_route("HEAD", "/stream/{message_id}", self.handle_stream)
+        self._app.router.add_route("GET", "/download/{message_id}", self.handle_download)
+        self._app.router.add_route("HEAD", "/download/{message_id}", self.handle_download)
 
     async def start(self) -> None:
         self._runner = web.AppRunner(self._app, access_log=None)
@@ -83,7 +102,7 @@ class BotWebServer:
         return web.json_response(
             {
                 "status": "ok",
-                "service": "telegram-movie-catalog-bot",
+                "service": "spy-movie-botz-catalog",
                 "telegram_connected": bool(
                     self._tg_client and getattr(self._tg_client, "is_connected", False)
                 ),
@@ -103,8 +122,16 @@ class BotWebServer:
             status=200,
         )
 
+    async def handle_logo(self, request: web.Request) -> web.StreamResponse:
+        if not LOGO_PATH.is_file():
+            return web.Response(status=404, text="Logo not found")
+        return web.FileResponse(
+            LOGO_PATH,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     async def handle_watch_page(self, request: web.Request) -> web.StreamResponse:
-        """Serve HTML5 player for browser tabs, or raw byte-range stream for video players."""
+        """Serve SPY MOVIE BOTZ player page for browsers, or raw byte-range stream for APKs."""
         accept = request.headers.get("Accept", "")
         has_range = "Range" in request.headers
         wants_player = request.query.get("player") == "1" or (
@@ -118,65 +145,210 @@ class BotWebServer:
             return web.json_response({"error": "Invalid message ID"}, status=400)
 
         msg_id = int(raw_id)
-        safe_title = f"Stream #{msg_id}"
+        safe_file_name = f"Stream #{msg_id}"
+        size_label = ""
         if self._tg_client and getattr(self._tg_client, "is_connected", False):
             try:
                 msg = await self._tg_client.get_messages(self._storage_channel_id, msg_id)
-                file_name, _, _ = _extract_media_meta(msg)
+                file_name, file_size, _ = _extract_media_meta(msg)
                 if file_name:
-                    safe_title = html.escape(file_name)
+                    safe_file_name = html.escape(file_name)
+                if file_size > 0:
+                    size_label = _format_size(file_size)
             except Exception as exc:
                 logger.debug("Could not fetch metadata for watch page %s: %s", msg_id, exc)
+
+        scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+        host = request.headers.get("X-Forwarded-Host", request.host)
+        stream_abs_url = f"{scheme}://{host}/stream/{msg_id}"
+        vlc_url = f"vlc://{stream_abs_url}"
+        mx_url = f"intent:{stream_abs_url}#Intent;package=com.mxtech.videoplayer.ad;S.title={safe_file_name};end"
+        meta_line = f"{safe_file_name} &middot; {size_label}" if size_label else safe_file_name
 
         page = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>{safe_title}</title>
+  <title>SPY MOVIE BOTZ — {safe_file_name}</title>
   <style>
+    * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      background: #0b0f19;
+      background: #090d16;
       color: #f8fafc;
-      font-family: system-ui, -apple-system, sans-serif;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
       min-height: 100vh;
-      padding: 16px;
-      box-sizing: border-box;
+      padding: 24px 16px 36px;
     }}
-    .wrap {{ width: 100%; max-width: 960px; }}
-    h1 {{ font-size: 1rem; font-weight: 600; margin: 0 0 12px; color: #e2e8f0; }}
-    video {{
+    .wrap {{
       width: 100%;
-      max-height: 80vh;
-      background: #000;
-      border-radius: 8px;
+      max-width: 920px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
     }}
-    .actions {{ margin-top: 12px; }}
-    a.btn {{
-      display: inline-block;
-      padding: 10px 16px;
-      background: #2563eb;
-      color: #fff;
-      text-decoration: none;
-      border-radius: 6px;
+    .brand {{
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      margin-bottom: 18px;
+    }}
+    .logo {{
+      width: 118px;
+      height: 118px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 2px solid rgba(251, 191, 36, 0.55);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+      margin-bottom: 14px;
+    }}
+    .brand-title {{
+      font-size: 1.5rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      margin: 0;
+      color: #ffffff;
+    }}
+    .file-subtitle {{
       font-size: 0.875rem;
-      font-weight: 500;
+      color: #94a3b8;
+      margin: 6px 0 0;
+      word-break: break-word;
+      max-width: 680px;
+    }}
+    .player-shell {{
+      width: 100%;
+      background: #000000;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      overflow: hidden;
+    }}
+    video {{
+      display: block;
+      width: 100%;
+      max-height: 72vh;
+      background: #000000;
+    }}
+    .actions {{
+      width: 100%;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }}
+    a.btn, button.btn {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 11px 18px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: background 0.15s ease;
+    }}
+    .btn-primary {{
+      background: #2563eb;
+      color: #ffffff;
+    }}
+    .btn-primary:hover {{ background: #1d4ed8; }}
+    .btn-secondary {{
+      background: #141b2d;
+      color: #e2e8f0;
+      border-color: #26324d;
+    }}
+    .btn-secondary:hover {{ background: #1e293b; }}
+    .notice-card {{
+      width: 100%;
+      margin-top: 22px;
+      padding: 18px 20px;
+      background: #101726;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      text-align: center;
+      line-height: 1.6;
+    }}
+    .eac3-note {{
+      margin: 0 0 14px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #fbbf24;
+    }}
+    .disclaimer-heading {{
+      margin: 0 0 6px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: #e2e8f0;
+    }}
+    .disclaimer-body {{
+      margin: 0 0 12px;
+      font-size: 0.8125rem;
+      color: #94a3b8;
+    }}
+    .copyright {{
+      margin: 0;
+      font-size: 0.75rem;
+      color: #64748b;
     }}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>{safe_title}</h1>
-    <video controls playsinline preload="metadata" src="/stream/{msg_id}"></video>
+    <div class="brand">
+      <img class="logo" src="/assets/logo.png" alt="SPY MOVIE BOTZ" />
+      <h1 class="brand-title">SPY MOVIE BOTZ</h1>
+      <p class="file-subtitle">{meta_line}</p>
+    </div>
+
+    <div class="player-shell">
+      <video controls playsinline preload="metadata" src="/stream/{msg_id}"></video>
+    </div>
+
     <div class="actions">
-      <a class="btn" href="/download/{msg_id}">Download File</a>
+      <a class="btn btn-primary" href="/download/{msg_id}">Fast Download</a>
+      <a class="btn btn-secondary" href="{vlc_url}">Open in VLC</a>
+      <a class="btn btn-secondary" href="{mx_url}">Open in MX Player</a>
+      <button class="btn btn-secondary" type="button" id="copyBtn">Copy Stream Link</button>
+    </div>
+
+    <div class="notice-card">
+      <p class="eac3-note">Browser Does Not Support EAC3 Audio. If No Sound, Please Use External Players.</p>
+      <p class="disclaimer-heading">DISCLAIMER</p>
+      <p class="disclaimer-body">
+        SpyMovieBotz Does Not Host Any Content. All Videos Are Provided By Third-Party Services.
+        We Are Not Responsible For Any Legal Issues.
+      </p>
+      <p class="copyright">
+        2026 SPYMOVIEBOTZ All rights reserved.<br />
+        This Service Is For Personal Use Only
+      </p>
     </div>
   </div>
+
+  <script>
+    (function () {{
+      var btn = document.getElementById('copyBtn');
+      if (!btn) return;
+      btn.addEventListener('click', function () {{
+        var url = {stream_abs_url!r};
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(url).then(function () {{
+            btn.textContent = 'Stream Link Copied';
+            setTimeout(function () {{ btn.textContent = 'Copy Stream Link'; }}, 1800);
+          }});
+        }}
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
         return web.Response(text=page, content_type="text/html")
@@ -251,9 +423,13 @@ class BotWebServer:
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
             "Content-Disposition": f'{disposition}; filename="{safe_filename}"',
+            "Cache-Control": "public, max-age=3600",
         }
         if status_code == 206:
             headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
+
+        if request.method == "HEAD":
+            return web.Response(status=status_code, headers=headers)
 
         response = web.StreamResponse(status=status_code, headers=headers)
         await response.prepare(request)
@@ -262,10 +438,36 @@ class BotWebServer:
         first_chunk_skip = start_byte % TELEGRAM_CHUNK_SIZE
         remaining = content_length
 
+        chunk_queue: asyncio.Queue[Optional[bytes | BaseException]] = asyncio.Queue(
+            maxsize=PREFETCH_QUEUE_CHUNKS
+        )
+
+        async def _prefetch_producer() -> None:
+            cancelled = False
+            try:
+                async for chunk in self._tg_client.stream_media(message, offset=start_chunk):
+                    if not chunk:
+                        break
+                    await chunk_queue.put(chunk)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except Exception as exc:
+                await chunk_queue.put(exc)
+            finally:
+                if not cancelled:
+                    await chunk_queue.put(None)
+
+        producer_task = asyncio.create_task(_prefetch_producer())
+
         try:
-            async for chunk in self._tg_client.stream_media(message, offset=start_chunk):
-                if not chunk or remaining <= 0:
+            while remaining > 0:
+                item = await chunk_queue.get()
+                if item is None:
                     break
+                if isinstance(item, BaseException):
+                    raise item
+                chunk = item
                 if first_chunk_skip:
                     chunk = chunk[first_chunk_skip:]
                     first_chunk_skip = 0
@@ -274,12 +476,17 @@ class BotWebServer:
                 if chunk:
                     await response.write(chunk)
                     remaining -= len(chunk)
-                if remaining <= 0:
-                    break
-        except (ConnectionResetError, BrokenPipeError):
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             logger.debug("Client disconnected during stream of message %s", msg_id)
         except Exception as exc:
             logger.error("Error streaming message %s: %s", msg_id, exc)
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         try:
             await response.write_eof()

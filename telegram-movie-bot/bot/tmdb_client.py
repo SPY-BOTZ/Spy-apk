@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import aiohttp
@@ -75,6 +75,8 @@ class TmdbMetadata:
     tmdb_id: Optional[int]
     media_type: str
     matched: bool
+    cast: list[str] = field(default_factory=list)
+    genres: list[str] = field(default_factory=list)
 
 
 class TmdbClient:
@@ -190,7 +192,32 @@ class TmdbClient:
             tmdb_id=item.get("id"),
             media_type=media_type,
             matched=True,
+            cast=[],
+            genres=genres,
         )
+
+    async def _fetch_cast(self, media_type: str, tmdb_id: Optional[int]) -> list[str]:
+        if not tmdb_id:
+            return []
+        session = await self._get_session()
+        url = f"{TMDB_API_BASE}/{media_type}/{tmdb_id}/credits"
+        try:
+            async with session.get(url, params={"api_key": self._api_key}) as resp:
+                if resp.status != 200:
+                    return []
+                payload = await resp.json()
+                cast_list = payload.get("cast")
+                if not isinstance(cast_list, list):
+                    return []
+                names = [
+                    str(c.get("name")).strip()
+                    for c in cast_list[:6]
+                    if isinstance(c, dict) and c.get("name")
+                ]
+                return names
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            logger.debug("TMDB credits fetch failed for %s/%s: %s", media_type, tmdb_id, exc)
+            return []
 
     async def lookup(
         self,
@@ -225,11 +252,15 @@ class TmdbClient:
                 if year:
                     results = await self._search(media_type, query_variant, year=year)
                     if results:
-                        return self._map_result(results[0], media_type, clean_query, year)
+                        meta = self._map_result(results[0], media_type, clean_query, year)
+                        meta.cast = await self._fetch_cast(media_type, meta.tmdb_id)
+                        return meta
 
                 results = await self._search(media_type, query_variant, year=None)
                 if results:
-                    return self._map_result(results[0], media_type, clean_query, year)
+                    meta = self._map_result(results[0], media_type, clean_query, year)
+                    meta.cast = await self._fetch_cast(media_type, meta.tmdb_id)
+                    return meta
 
         return TmdbMetadata(
             title=clean_query,
