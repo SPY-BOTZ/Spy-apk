@@ -43,6 +43,33 @@ _EXT_MIME_MAP = {
 LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "spy_movie_botz_logo.png"
 
 
+def _is_embedded_webview(request: web.Request) -> bool:
+    """Detect Android/iOS in-app WebViews so raw binary downloads hand off safely to Chrome/ADM."""
+    if request.method != "GET":
+        return False
+    if request.query.get("raw") == "1" or "Range" in request.headers:
+        return False
+    if request.query.get("launcher") == "1":
+        return True
+    accept = request.headers.get("Accept", "")
+    if "text/html" not in accept:
+        return False
+    ua = request.headers.get("User-Agent", "").lower()
+    x_req = request.headers.get("X-Requested-With", "").strip().lower()
+    if "; wv)" in ua or " wv)" in ua:
+        return True
+    if x_req and x_req not in ("xmlhttprequest",):
+        return True
+    return False
+
+
+def _sanitize_header_filename(file_name: str, msg_id: int) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|#\r\n]+', "_", file_name).strip(" ._")
+    if not cleaned:
+        return f"SpyMovieBotz_{msg_id}.mp4"
+    return cleaned
+
+
 def _extract_media_meta(message: Any) -> tuple[Optional[str], int, str, str]:
     """Return `(file_name, file_size, mime_type, file_id)` for a Pyrogram message."""
     media = message.video or message.document or message.audio
@@ -476,7 +503,7 @@ class BotWebServer:
     </div>
 
     <div class="actions">
-      <a class="btn btn-primary" href="{direct_dl_path}">Direct Download</a>
+      <a class="btn btn-primary" id="directDlBtn" href="{direct_dl_path}">Direct Download</a>
       <a class="btn btn-secondary" href="{vlc_url}">Open in VLC</a>
       <a class="btn btn-secondary" href="{mx_url}">Open in MX Player</a>
     </div>
@@ -506,6 +533,15 @@ class BotWebServer:
           errBox.classList.add('visible');
         }});
       }}
+      var dlBtn = document.getElementById('directDlBtn');
+      if (dlBtn) {{
+        var ua = navigator.userAgent || '';
+        var isAndroid = /Android/i.test(ua);
+        var isWebView = /; wv\)/i.test(ua) || (isAndroid && !window.chrome);
+        if (isWebView) {{
+          dlBtn.setAttribute('href', {direct_dl_path!r} + '?launcher=1');
+        }}
+      }}
     }})();
   </script>
 </body>
@@ -527,10 +563,272 @@ class BotWebServer:
             self._msg_cache[msg_id] = (now, message)
         return message
 
+    async def _render_download_launcher_page(
+        self,
+        request: web.Request,
+        *,
+        msg_id: int,
+        sig: Optional[str] = None,
+    ) -> web.Response:
+        """Render a WebView-safe download handoff page so Android APKs launch Chrome/ADM without crashing."""
+        raw_file_name: Optional[str] = None
+        safe_file_name = f"Movie_{msg_id}.mp4"
+        size_label = ""
+        parsed_lang = ""
+        parsed_qual = ""
+
+        if self._tg_client and getattr(self._tg_client, "is_connected", False):
+            try:
+                msg = await self._get_cached_message(msg_id)
+                if msg:
+                    file_name, file_size, _, _ = _extract_media_meta(msg)
+                    if file_name:
+                        raw_file_name = file_name
+                        safe_file_name = html.escape(file_name)
+                    if file_size > 0:
+                        size_label = _format_size(file_size)
+                    parsed = parse_media_metadata(
+                        filename=raw_file_name,
+                        caption=getattr(msg, "caption", None),
+                    )
+                    parsed_lang = parsed.language or ""
+                    parsed_qual = parsed.quality or ""
+            except Exception as exc:
+                logger.debug("Could not fetch metadata for download launcher %s: %s", msg_id, exc)
+
+        scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+        host = request.headers.get("X-Forwarded-Host", request.host)
+        if sig and self._link_generator:
+            speed_links = self._link_generator.generate(message_id=msg_id, file_name=raw_file_name)
+            base_dl_path = f"/dl/{sig}/{msg_id}/{speed_links.safe_filename}"
+        elif sig:
+            base_dl_path = f"/dl/{sig}/{msg_id}"
+        else:
+            base_dl_path = f"/download/{msg_id}"
+
+        raw_dl_path = f"{base_dl_path}?raw=1"
+        raw_abs_url = f"{scheme}://{host}{raw_dl_path}"
+        chrome_intent = (
+            f"intent://{host}{raw_dl_path}"
+            f"#Intent;scheme={scheme};package=com.android.chrome;action=android.intent.action.VIEW;end"
+        )
+        browser_intent = (
+            f"intent://{host}{raw_dl_path}"
+            f"#Intent;scheme={scheme};action=android.intent.action.VIEW;end"
+        )
+
+        tag_items: list[str] = []
+        if parsed_lang:
+            tag_items.append(f'<span class="tag-lang">{html.escape(parsed_lang)}</span>')
+        if parsed_qual:
+            tag_items.append(f'<span class="tag-qual">{html.escape(parsed_qual)}</span>')
+        if size_label:
+            tag_items.append(f'<span class="tag-size">{html.escape(size_label)}</span>')
+        tags_html = f'<div class="media-tags">{"".join(tag_items)}</div>' if tag_items else ""
+
+        page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Download — {safe_file_name} | SPY MOVIE BOTZ</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: #090d16;
+      color: #f8fafc;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 24px 16px 36px;
+    }}
+    .wrap {{
+      width: 100%;
+      max-width: 560px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }}
+    .top-nav {{
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 18px;
+    }}
+    .nav-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      background: #141b2d;
+      color: #e2e8f0;
+      border: 1px solid #26324d;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+    }}
+    .card {{
+      width: 100%;
+      background: #101726;
+      border: 1px solid #1e293b;
+      border-radius: 14px;
+      padding: 24px 20px;
+      text-align: center;
+    }}
+    .logo {{
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 2px solid rgba(251, 191, 36, 0.55);
+      margin-bottom: 12px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+    }}
+    .file-name {{
+      margin: 10px 0 0;
+      font-size: 0.9rem;
+      color: #cbd5e1;
+      word-break: break-word;
+      font-weight: 600;
+    }}
+    .media-tags {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 12px;
+    }}
+    .tag-lang {{
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: rgba(37, 99, 235, 0.22);
+      border: 1px solid rgba(96, 165, 250, 0.45);
+      color: #93c5fd;
+      font-size: 0.9rem;
+      font-weight: 700;
+    }}
+    .tag-qual {{
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: rgba(251, 191, 36, 0.16);
+      border: 1px solid rgba(251, 191, 36, 0.4);
+      color: #fcd34d;
+      font-size: 0.88rem;
+      font-weight: 700;
+    }}
+    .tag-size {{
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: #141b2d;
+      border: 1px solid #26324d;
+      color: #cbd5e1;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }}
+    .hint {{
+      margin: 16px 0 18px;
+      font-size: 0.84rem;
+      color: #94a3b8;
+      line-height: 1.5;
+    }}
+    .stack {{
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      width: 100%;
+    }}
+    a.btn, button.btn {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      padding: 13px 16px;
+      border-radius: 9px;
+      font-size: 0.92rem;
+      font-weight: 700;
+      text-decoration: none;
+      border: 1px solid transparent;
+      cursor: pointer;
+    }}
+    .btn-chrome {{ background: #2563eb; color: #ffffff; }}
+    .btn-browser {{ background: #0f766e; color: #ffffff; }}
+    .btn-raw {{ background: #141b2d; color: #e2e8f0; border-color: #26324d; }}
+    .btn-watch {{ background: #1e293b; color: #f8fafc; }}
+    .btn-channel {{
+      margin-top: 16px;
+      background: #0088cc;
+      color: #ffffff;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top-nav">
+      <button type="button" class="nav-btn" onclick="if (window.history.length > 1) {{ window.history.back(); }} else {{ window.location.href = '/watch/{msg_id}'; }}">&larr; Back</button>
+      <a class="nav-btn" href="{TELEGRAM_CHANNEL_URL}" target="_blank" rel="noopener noreferrer">&#127968; SPY MOVIE BOTZ Home</a>
+    </div>
+
+    <div class="card">
+      <img class="logo" src="/assets/logo.png" alt="SPY MOVIE BOTZ" />
+      <h1>SPY MOVIE BOTZ</h1>
+      <p class="file-name">{safe_file_name}</p>
+      {tags_html}
+      <p class="hint">
+        Tap <strong>Download in Chrome</strong> or <strong>Open in Browser / 1DM / ADM</strong> below so Android downloads the full file smoothly without closing the app.
+      </p>
+
+      <div class="stack">
+        <a class="btn btn-chrome" href="{chrome_intent}">&#9889; Download in Chrome</a>
+        <a class="btn btn-browser" href="{browser_intent}">&#128229; Open in Browser / 1DM / ADM</a>
+        <a class="btn btn-raw" href="{raw_dl_path}" target="_blank" rel="noopener noreferrer" download>&#11015; Direct Browser Download</a>
+        <button type="button" class="btn btn-raw" id="copyDlBtn">&#128203; Copy Download Link</button>
+        <a class="btn btn-watch" href="/watch/{msg_id}">&#9654; Watch / Play Online</a>
+      </div>
+    </div>
+
+    <a class="btn btn-channel" href="{TELEGRAM_CHANNEL_URL}" target="_blank" rel="noopener noreferrer">JOIN TELEGRAM CHANNEL</a>
+  </div>
+
+  <script>
+    (function () {{
+      var btn = document.getElementById('copyDlBtn');
+      if (!btn) return;
+      btn.addEventListener('click', function () {{
+        var url = {raw_abs_url!r};
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(url).then(function () {{
+            btn.textContent = 'Download Link Copied! Paste in Chrome / 1DM';
+            setTimeout(function () {{ btn.textContent = 'Copy Download Link'; }}, 2200);
+          }});
+        }}
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
+        return web.Response(text=page, content_type="text/html")
+
     async def handle_stream(self, request: web.Request) -> web.StreamResponse:
         return await self._serve_telegram_media(request, as_attachment=False)
 
     async def handle_download(self, request: web.Request) -> web.StreamResponse:
+        raw_id = request.match_info["message_id"]
+        if not raw_id.isdigit():
+            return web.json_response({"error": "Invalid message ID"}, status=400)
+        if _is_embedded_webview(request):
+            return await self._render_download_launcher_page(request, msg_id=int(raw_id))
         return await self._serve_telegram_media(request, as_attachment=True)
 
     async def handle_signed_download(self, request: web.Request) -> web.StreamResponse:
@@ -538,8 +836,11 @@ class BotWebServer:
         sig = request.match_info.get("sig", "")
         if not raw_id.isdigit():
             return web.json_response({"error": "Invalid message ID"}, status=400)
-        if self._link_generator and not self._link_generator.verify(int(raw_id), sig):
+        msg_id = int(raw_id)
+        if self._link_generator and not self._link_generator.verify(msg_id, sig):
             return web.json_response({"error": "Invalid download signature"}, status=403)
+        if _is_embedded_webview(request):
+            return await self._render_download_launcher_page(request, msg_id=msg_id, sig=sig)
         return await self._serve_telegram_media(request, as_attachment=True)
 
     async def _stream_via_pyrogram_fallback(
@@ -624,13 +925,17 @@ class BotWebServer:
 
         content_length = (end_byte - start_byte) + 1
         disposition = "attachment" if as_attachment else "inline"
-        safe_filename = file_name.replace('"', "")
+        safe_filename = _sanitize_header_filename(file_name, msg_id)
+        encoded_filename = quote(file_name, safe="")
 
         headers = {
             "Content-Type": mime_type,
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
-            "Content-Disposition": f'{disposition}; filename="{safe_filename}"',
+            "Content-Disposition": (
+                f'{disposition}; filename="{safe_filename}"; '
+                f"filename*=UTF-8''{encoded_filename}"
+            ),
             "Cache-Control": "public, max-age=3600",
         }
         if status_code == 206:

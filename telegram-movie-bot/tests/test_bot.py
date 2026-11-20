@@ -209,5 +209,16 @@ class SendMediaLimiterTests(unittest.IsolatedAsyncioTestCase):
             await limiter.execute(flaky_call, fallback_on_flood=True)
 
 
+class HeaderSanitizationTests(unittest.TestCase):
+    def test_sanitize_header_filename_strips_hash_and_illegal_chars(self) -> None:
+        from bot.web_server import _sanitize_header_filename
+
+        self.assertEqual(
+            _sanitize_header_filename("#Cult_2026_1080p.mkv", 569),
+            "Cult_2026_1080p.mkv",
+        )
+        self.assertEqual(_sanitize_header_filename("###", 42), "SpyMovieBotz_42.mp4")
+
+
 if __name__ == "__main__":
     unittest.main()
