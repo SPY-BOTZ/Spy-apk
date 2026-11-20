@@ -220,5 +220,19 @@ class HeaderSanitizationTests(unittest.TestCase):
         self.assertEqual(_sanitize_header_filename("###", 42), "SpyMovieBotz_42.mp4")
 
 
+class WebViewLauncherTests(unittest.TestCase):
+    def test_chrome_navigate_url_encodes_raw_download_link(self) -> None:
+        from bot.web_server import BotWebServer, _build_chrome_navigate_url
+
+        target = "https://example.com/dl/abc123def4567890/42/Movie.mkv?raw=1"
+        url = _build_chrome_navigate_url(target)
+        self.assertTrue(url.startswith("googlechrome://navigate?url=https%3A%2F%2F"))
+        self.assertIn("%3Fraw%3D1", url)
+
+        server = BotWebServer(port=8000, storage_channel_id=-1001, start_time=0.0)
+        server.set_bot_username(" @Spy_Google_Drive_Save_bot ")
+        self.assertEqual(server._bot_username, "Spy_Google_Drive_Save_bot")
+
+
 if __name__ == "__main__":
     unittest.main()

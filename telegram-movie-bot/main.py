@@ -102,6 +102,7 @@ async def run_bot() -> None:
     try:
         await tg_client.start()
         me = await tg_client.get_me()
+        web_server.set_bot_username(me.username)
         logger.info("Telegram bot started as @%s (id=%s)", me.username, me.id)
         await stop_event.wait()
     finally:

@@ -694,6 +694,61 @@ def register_handlers(
             )
         )
 
+    async def _send_user_download_by_message_id(message: Message, msg_id: int) -> None:
+        try:
+            storage_msg = await app.get_messages(settings.storage_channel_id, msg_id)
+        except RPCError as exc:
+            await _run_with_floodwait(
+                lambda: message.reply_text(f"❌ Could not fetch file: `{exc}`", quote=True)
+            )
+            return
+
+        if not storage_msg or getattr(storage_msg, "empty", False):
+            await _run_with_floodwait(
+                lambda: message.reply_text("❌ File not found or was removed.", quote=True)
+            )
+            return
+
+        media = (
+            getattr(storage_msg, "video", None)
+            or getattr(storage_msg, "document", None)
+            or getattr(storage_msg, "audio", None)
+        )
+        if not media:
+            await _run_with_floodwait(
+                lambda: message.reply_text("❌ No downloadable media found for this item.", quote=True)
+            )
+            return
+
+        file_name = getattr(media, "file_name", None) or f"SpyMovieBotz_{msg_id}.mp4"
+        file_size = int(getattr(media, "file_size", 0) or 0)
+        parsed = parse_media_metadata(
+            filename=file_name,
+            caption=getattr(storage_msg, "caption", None),
+        )
+        lang = parsed.language or "Hindi"
+        qual = parsed.quality or _infer_quality_from_message(storage_msg, parsed.is_series) or "HD"
+        links = link_generator.generate(message_id=msg_id, file_name=file_name)
+        size_mb = file_size / (1024 * 1024) if file_size else 0.0
+        size_str = f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
+        size_part = f" | 💾 **Size:** `{size_str}`" if file_size > 0 else ""
+
+        caption = (
+            f"🎬 **{parsed.title or file_name}**\n"
+            f"🌐 **Language:** {lang} | 🎞 **Quality:** {qual}{size_part}\n"
+            f"📁 `{file_name}`\n\n"
+            f"Tap **⚡ Direct Download** below to download at full speed in Chrome."
+        )
+        keyboard = _build_user_download_keyboard(links.watch_url, links.direct_download_url)
+        await _run_with_floodwait(
+            lambda: message.reply_text(
+                caption,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+                quote=True,
+            )
+        )
+
     # ------------------------------------------------------------------
     # /start, /help & /dl
     # ------------------------------------------------------------------
@@ -701,10 +756,15 @@ def register_handlers(
     @app.on_message(filters.command(["start", "help"]))
     async def cmd_start(client: Client, message: Message) -> None:
         args = (message.text or "").split(maxsplit=1)
-        if len(args) == 2 and args[1].strip().startswith("dl_"):
-            fkey = args[1].strip()[3:]
-            if fkey:
-                await _send_user_download_card(message, fkey)
+        if len(args) == 2:
+            payload = args[1].strip()
+            if payload.startswith("dl_"):
+                fkey = payload[3:]
+                if fkey:
+                    await _send_user_download_card(message, fkey)
+                    return
+            elif payload.startswith("dlm_") and payload[4:].isdigit():
+                await _send_user_download_by_message_id(message, int(payload[4:]))
                 return
 
         uid = message.from_user.id if message.from_user else None

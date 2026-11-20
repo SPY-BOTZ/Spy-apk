@@ -70,6 +70,11 @@ def _sanitize_header_filename(file_name: str, msg_id: int) -> str:
     return cleaned
 
 
+def _build_chrome_navigate_url(target_url: str) -> str:
+    """Build a googlechrome:// URI scheme link compatible with simple WebView ACTION_VIEW handlers."""
+    return f"googlechrome://navigate?url={quote(target_url, safe='')}"
+
+
 def _extract_media_meta(message: Any) -> tuple[Optional[str], int, str, str]:
     """Return `(file_name, file_size, mime_type, file_id)` for a Pyrogram message."""
     media = message.video or message.document or message.audio
@@ -118,11 +123,15 @@ class BotWebServer:
         self._link_generator = link_generator
         self._tg_client: Optional["Client"] = None
         self._streamer: Optional[FastByteStreamer] = None
+        self._bot_username: str = ""
         self._msg_cache: dict[int, tuple[float, Any]] = {}
         self._app = web.Application()
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._register_routes()
+
+    def set_bot_username(self, username: Optional[str]) -> None:
+        self._bot_username = (username or "").lstrip("@").strip()
 
     def attach_telegram_client(self, client: "Client") -> None:
         self._tg_client = client
@@ -608,14 +617,26 @@ class BotWebServer:
 
         raw_dl_path = f"{base_dl_path}?raw=1"
         raw_abs_url = f"{scheme}://{host}{raw_dl_path}"
+        encoded_abs_url = quote(raw_abs_url, safe="")
+        chrome_scheme_url = _build_chrome_navigate_url(raw_abs_url)
         chrome_intent = (
             f"intent://{host}{raw_dl_path}"
-            f"#Intent;scheme={scheme};package=com.android.chrome;action=android.intent.action.VIEW;end"
+            f"#Intent;scheme={scheme};package=com.android.chrome;"
+            f"action=android.intent.action.VIEW;S.browser_fallback_url={encoded_abs_url};end"
         )
         browser_intent = (
             f"intent://{host}{raw_dl_path}"
-            f"#Intent;scheme={scheme};action=android.intent.action.VIEW;end"
+            f"#Intent;scheme={scheme};action=android.intent.action.VIEW;"
+            f"type=application/octet-stream;S.browser_fallback_url={encoded_abs_url};end"
         )
+        safe_dl_attr = html.escape(_sanitize_header_filename(raw_file_name or safe_file_name, msg_id))
+        tg_bot_dl_btn = ""
+        if self._bot_username:
+            tg_bot_url = f"https://t.me/{quote(self._bot_username, safe='')}?start=dlm_{msg_id}"
+            tg_bot_dl_btn = (
+                f'<a class="btn btn-telegram" href="{tg_bot_url}">'
+                "&#128242; Download via Telegram Bot</a>"
+            )
 
         tag_items: list[str] = []
         if parsed_lang:
@@ -763,6 +784,7 @@ class BotWebServer:
       cursor: pointer;
     }}
     .btn-chrome {{ background: #2563eb; color: #ffffff; }}
+    .btn-telegram {{ background: #0284c7; color: #ffffff; }}
     .btn-browser {{ background: #0f766e; color: #ffffff; }}
     .btn-raw {{ background: #141b2d; color: #e2e8f0; border-color: #26324d; }}
     .btn-watch {{ background: #1e293b; color: #f8fafc; }}
@@ -771,13 +793,25 @@ class BotWebServer:
       background: #0088cc;
       color: #ffffff;
     }}
+    .wv-status {{
+      display: none;
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(245, 158, 11, 0.14);
+      border: 1px solid rgba(251, 191, 36, 0.35);
+      color: #fde68a;
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }}
+    .wv-status.visible {{ display: block; }}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="top-nav">
       <button type="button" class="nav-btn" onclick="if (window.history.length > 1) {{ window.history.back(); }} else {{ window.location.href = '/watch/{msg_id}'; }}">&larr; Back</button>
-      <a class="nav-btn" href="{TELEGRAM_CHANNEL_URL}" target="_blank" rel="noopener noreferrer">&#127968; SPY MOVIE BOTZ Home</a>
+      <a class="nav-btn" href="{TELEGRAM_CHANNEL_URL}">&#127968; SPY MOVIE BOTZ Home</a>
     </div>
 
     <div class="card">
@@ -786,34 +820,75 @@ class BotWebServer:
       <p class="file-name">{safe_file_name}</p>
       {tags_html}
       <p class="hint">
-        Tap <strong>Download in Chrome</strong> or <strong>Open in Browser / 1DM / ADM</strong> below so Android downloads the full file smoothly without closing the app.
+        Tap <strong>Download in Chrome</strong> or <strong>Download via Telegram Bot</strong> below to download at full speed.
       </p>
 
       <div class="stack">
-        <a class="btn btn-chrome" href="{chrome_intent}">&#9889; Download in Chrome</a>
+        <a class="btn btn-chrome" id="chromeDlBtn" href="{chrome_scheme_url}">&#9889; Download in Chrome</a>
+        {tg_bot_dl_btn}
         <a class="btn btn-browser" href="{browser_intent}">&#128229; Open in Browser / 1DM / ADM</a>
-        <a class="btn btn-raw" href="{raw_dl_path}" target="_blank" rel="noopener noreferrer" download>&#11015; Direct Browser Download</a>
+        <a class="btn btn-raw" href="{raw_dl_path}" download="{safe_dl_attr}">&#11015; Direct Browser Download</a>
         <button type="button" class="btn btn-raw" id="copyDlBtn">&#128203; Copy Download Link</button>
         <a class="btn btn-watch" href="/watch/{msg_id}">&#9654; Watch / Play Online</a>
       </div>
+      <div class="wv-status" id="wvStatus">
+        App WebView blocked Chrome launch. Tap <strong>Download via Telegram Bot</strong> or <strong>Direct Browser Download</strong> above, or paste the copied link in Chrome.
+      </div>
     </div>
 
-    <a class="btn btn-channel" href="{TELEGRAM_CHANNEL_URL}" target="_blank" rel="noopener noreferrer">JOIN TELEGRAM CHANNEL</a>
+    <a class="btn btn-channel" href="{TELEGRAM_CHANNEL_URL}">JOIN TELEGRAM CHANNEL</a>
   </div>
 
   <script>
     (function () {{
+      var rawAbsUrl = {raw_abs_url!r};
+      var chromeIntentUrl = {chrome_intent!r};
+      var chromeBtn = document.getElementById('chromeDlBtn');
+      var wvStatus = document.getElementById('wvStatus');
+      if (chromeBtn) {{
+        chromeBtn.addEventListener('click', function () {{
+          setTimeout(function () {{
+            if (!document.hidden) {{
+              try {{ window.location.href = chromeIntentUrl; }} catch (e) {{}}
+              setTimeout(function () {{
+                if (!document.hidden && wvStatus) {{
+                  wvStatus.classList.add('visible');
+                }}
+              }}, 650);
+            }}
+          }}, 750);
+        }});
+      }}
+
       var btn = document.getElementById('copyDlBtn');
       if (!btn) return;
+      function markCopied() {{
+        btn.textContent = 'Download Link Copied! Paste in Chrome / 1DM';
+        setTimeout(function () {{ btn.textContent = 'Copy Download Link'; }}, 2200);
+      }}
       btn.addEventListener('click', function () {{
-        var url = {raw_abs_url!r};
         if (navigator.clipboard && navigator.clipboard.writeText) {{
-          navigator.clipboard.writeText(url).then(function () {{
-            btn.textContent = 'Download Link Copied! Paste in Chrome / 1DM';
-            setTimeout(function () {{ btn.textContent = 'Copy Download Link'; }}, 2200);
+          navigator.clipboard.writeText(rawAbsUrl).then(markCopied).catch(function () {{
+            fallbackCopy();
           }});
+        }} else {{
+          fallbackCopy();
         }}
       }});
+      function fallbackCopy() {{
+        var ta = document.createElement('textarea');
+        ta.value = rawAbsUrl;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {{
+          document.execCommand('copy');
+          markCopied();
+        }} catch (e) {{}}
+        document.body.removeChild(ta);
+      }}
     }})();
   </script>
 </body>
@@ -925,11 +1000,12 @@ class BotWebServer:
 
         content_length = (end_byte - start_byte) + 1
         disposition = "attachment" if as_attachment else "inline"
+        response_content_type = "application/octet-stream" if as_attachment else mime_type
         safe_filename = _sanitize_header_filename(file_name, msg_id)
         encoded_filename = quote(file_name, safe="")
 
         headers = {
-            "Content-Type": mime_type,
+            "Content-Type": response_content_type,
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
             "Content-Disposition": (
