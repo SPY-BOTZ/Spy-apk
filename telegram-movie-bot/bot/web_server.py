@@ -624,19 +624,7 @@ class BotWebServer:
             f"#Intent;scheme={scheme};package=com.android.chrome;"
             f"action=android.intent.action.VIEW;S.browser_fallback_url={encoded_abs_url};end"
         )
-        browser_intent = (
-            f"intent://{host}{raw_dl_path}"
-            f"#Intent;scheme={scheme};action=android.intent.action.VIEW;"
-            f"type=application/octet-stream;S.browser_fallback_url={encoded_abs_url};end"
-        )
         safe_dl_attr = html.escape(_sanitize_header_filename(raw_file_name or safe_file_name, msg_id))
-        tg_bot_dl_btn = ""
-        if self._bot_username:
-            tg_bot_url = f"https://t.me/{quote(self._bot_username, safe='')}?start=dlm_{msg_id}"
-            tg_bot_dl_btn = (
-                f'<a class="btn btn-telegram" href="{tg_bot_url}">'
-                "&#128242; Download via Telegram Bot</a>"
-            )
 
         tag_items: list[str] = []
         if parsed_lang:
@@ -784,10 +772,14 @@ class BotWebServer:
       cursor: pointer;
     }}
     .btn-chrome {{ background: #2563eb; color: #ffffff; }}
-    .btn-telegram {{ background: #0284c7; color: #ffffff; }}
-    .btn-browser {{ background: #0f766e; color: #ffffff; }}
+    .btn-row {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      width: 100%;
+    }}
     .btn-raw {{ background: #141b2d; color: #e2e8f0; border-color: #26324d; }}
-    .btn-watch {{ background: #1e293b; color: #f8fafc; }}
+    .btn-watch {{ background: #1e293b; color: #f8fafc; border-color: #334155; }}
     .btn-channel {{
       margin-top: 16px;
       background: #0088cc;
@@ -795,7 +787,7 @@ class BotWebServer:
     }}
     .wv-status {{
       display: none;
-      margin-top: 12px;
+      margin-top: 14px;
       padding: 10px 12px;
       border-radius: 8px;
       background: rgba(245, 158, 11, 0.14);
@@ -819,20 +811,22 @@ class BotWebServer:
       <h1>SPY MOVIE BOTZ</h1>
       <p class="file-name">{safe_file_name}</p>
       {tags_html}
-      <p class="hint">
-        Tap <strong>Download in Chrome</strong> or <strong>Download via Telegram Bot</strong> below to download at full speed.
+      <p class="hint" id="dlHint">
+        Opening Chrome to start your download automatically&hellip;
       </p>
 
       <div class="stack">
-        <a class="btn btn-chrome" id="chromeDlBtn" href="{chrome_scheme_url}">&#9889; Download in Chrome</a>
-        {tg_bot_dl_btn}
-        <a class="btn btn-browser" href="{browser_intent}">&#128229; Open in Browser / 1DM / ADM</a>
-        <a class="btn btn-raw" href="{raw_dl_path}" download="{safe_dl_attr}">&#11015; Direct Browser Download</a>
-        <button type="button" class="btn btn-raw" id="copyDlBtn">&#128203; Copy Download Link</button>
-        <a class="btn btn-watch" href="/watch/{msg_id}">&#9654; Watch / Play Online</a>
+        <a class="btn btn-chrome" id="chromeDlBtn" href="{chrome_intent}">&#9889; Download in Chrome</a>
+        <div class="btn-row">
+          <a class="btn btn-raw" href="{raw_dl_path}" download="{safe_dl_attr}">&#11015; Direct Download</a>
+          <a class="btn btn-watch" href="/watch/{msg_id}">&#9654; Watch Online</a>
+        </div>
       </div>
       <div class="wv-status" id="wvStatus">
-        App WebView blocked Chrome launch. Tap <strong>Download via Telegram Bot</strong> or <strong>Direct Browser Download</strong> above, or paste the copied link in Chrome.
+        Chrome did not open automatically inside this app. Tap <strong>Download in Chrome</strong> above, or if the app blocks Chrome, copy the link below:
+        <div style="margin-top:8px;">
+          <button type="button" class="btn btn-raw" id="copyDlBtn" style="padding:9px 12px;font-size:0.84rem;">&#128203; Copy Download Link</button>
+        </div>
       </div>
     </div>
 
@@ -843,28 +837,57 @@ class BotWebServer:
     (function () {{
       var rawAbsUrl = {raw_abs_url!r};
       var chromeIntentUrl = {chrome_intent!r};
+      var chromeSchemeUrl = {chrome_scheme_url!r};
       var chromeBtn = document.getElementById('chromeDlBtn');
       var wvStatus = document.getElementById('wvStatus');
-      if (chromeBtn) {{
-        chromeBtn.addEventListener('click', function () {{
-          setTimeout(function () {{
-            if (!document.hidden) {{
-              try {{ window.location.href = chromeIntentUrl; }} catch (e) {{}}
-              setTimeout(function () {{
-                if (!document.hidden && wvStatus) {{
-                  wvStatus.classList.add('visible');
+      var dlHint = document.getElementById('dlHint');
+
+      function launchChrome() {{
+        try {{
+          window.location.href = chromeIntentUrl;
+        }} catch (e) {{}}
+        setTimeout(function () {{
+          if (!document.hidden) {{
+            try {{
+              window.location.href = chromeSchemeUrl;
+            }} catch (e) {{}}
+            setTimeout(function () {{
+              if (!document.hidden && wvStatus) {{
+                wvStatus.classList.add('visible');
+                if (dlHint) {{
+                  dlHint.textContent = 'Tap Download in Chrome or Direct Download below.';
                 }}
-              }}, 650);
-            }}
-          }}, 750);
+              }}
+            }}, 700);
+          }}
+        }}, 550);
+      }}
+
+      if (chromeBtn) {{
+        chromeBtn.addEventListener('click', function (ev) {{
+          ev.preventDefault();
+          launchChrome();
         }});
+      }}
+
+      var guardKey = 'dl_auto_' + {msg_id};
+      var alreadyTried = false;
+      try {{
+        alreadyTried = !!sessionStorage.getItem(guardKey);
+        if (!alreadyTried) sessionStorage.setItem(guardKey, '1');
+      }} catch (e) {{}}
+
+      if (!alreadyTried) {{
+        setTimeout(launchChrome, 150);
+      }} else if (wvStatus) {{
+        wvStatus.classList.add('visible');
       }}
 
       var btn = document.getElementById('copyDlBtn');
       if (!btn) return;
       function markCopied() {{
-        btn.textContent = 'Download Link Copied! Paste in Chrome / 1DM';
-        setTimeout(function () {{ btn.textContent = 'Copy Download Link'; }}, 2200);
+        btn.textContent = 'Link Copied! Open Chrome & Paste';
+        setTimeout(function () {{ btn.textContent = 'Copy Download Link'; }}, 2400);
       }}
       btn.addEventListener('click', function () {{
         if (navigator.clipboard && navigator.clipboard.writeText) {{
