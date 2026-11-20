@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Movie Catalog Bot Workbench",
+  "description": "Production-ready Python Telegram movie cataloging bot for Firebase Realtime Database, TMDB metadata lookup, multi-admin management, and Koyeb deployment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
