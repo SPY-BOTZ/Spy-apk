@@ -49,21 +49,21 @@ const ENV_VARS_SPEC = [
 const DEPLOY_STEPS = [
   {
     id: 'gh-push',
-    title: '01. Place telegram-movie-bot files in your GitHub repository',
+    title: '01. Push repository to GitHub',
     detail:
-      'Copy the contents of telegram-movie-bot/ to the root of your GitHub repository so main.py, requirements.txt, Procfile, runtime.txt, and bot/ sit at the repository top level.',
+      'Push this repository to GitHub (either the full workspace with telegram-movie-bot/ and root Dockerfile, or only the contents of telegram-movie-bot/ at repo root).',
+  },
+  {
+    id: 'koyeb-builder',
+    title: '02. Configure Koyeb Builder (Fixes Node.js lockfile error)',
+    detail:
+      'If deploying the full workspace repo, in Koyeb Service Settings -> Build & Deployment either set Buildpack Work directory to "telegram-movie-bot" OR switch Builder to "Dockerfile" (uses root Dockerfile).',
   },
   {
     id: 'tg-channel',
-    title: '02. Prepare Telegram Storage Channel and Bot Token',
+    title: '03. Prepare Telegram Storage Channel and Bot Token',
     detail:
       'Create a private Telegram channel, add your bot as an administrator with post/edit permissions, and record its numeric -100... channel ID for STORAGE_CHANNEL_ID.',
-  },
-  {
-    id: 'koyeb-create',
-    title: '03. Create a Koyeb Web Service from GitHub',
-    detail:
-      'In Koyeb, create a new App -> GitHub source -> select your repo. Keep the Web service type (not Worker) so HTTP port 8000 and /health checks stay active.',
   },
   {
     id: 'koyeb-env',
@@ -476,7 +476,7 @@ export default function App() {
                     <span className="text-xs text-slate-500">
                       {parsedPreview.language
                         ? `Auto-detected: ${parsedPreview.language}`
-                        : 'Missing in filename — prompts inline buttons'}
+                        : 'Auto-inferred from TMDB original_language'}
                     </span>
                   </div>
                   <div className="grid grid-cols-3 gap-2">
@@ -508,7 +508,7 @@ export default function App() {
                     <span className="text-xs text-slate-500">
                       {parsedPreview.quality
                         ? `Auto-detected: ${parsedPreview.quality}`
-                        : 'Missing in filename — prompts inline buttons'}
+                        : 'Auto-inferred from Telegram video resolution'}
                     </span>
                   </div>
                   <div className="grid grid-cols-4 gap-2">
@@ -543,7 +543,7 @@ export default function App() {
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
                     {parsedPreview.needsSelection
-                      ? 'Bot displays inline Language/Quality keyboard before POST'
+                      ? 'Auto-pushes immediately with TMDB/video fallback + inline edit buttons'
                       : 'All tags detected — bot auto-pushes immediately to /movies.json'}
                   </p>
                 </div>

@@ -45,6 +45,24 @@ TMDB_GENRE_MAP: dict[int, str] = {
 }
 
 
+TMDB_LANGUAGE_MAP: dict[str, str] = {
+    "hi": "Hindi",
+    "en": "English",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "bn": "Bangla",
+    "ml": "Malayalam",
+    "kn": "Kannada",
+    "pa": "Punjabi",
+    "mr": "Marathi",
+    "ko": "Korean",
+    "ja": "Japanese",
+    "es": "Spanish",
+    "fr": "French",
+    "zh": "Chinese",
+}
+
+
 @dataclass(slots=True)
 class TmdbMetadata:
     title: str
@@ -53,6 +71,7 @@ class TmdbMetadata:
     rating: float
     description: str
     category: str
+    original_language: Optional[str]
     tmdb_id: Optional[int]
     media_type: str
     matched: bool
@@ -133,7 +152,7 @@ class TmdbClient:
         release_date = item.get("release_date") or item.get("first_air_date") or ""
         year = release_date[:4] if len(release_date) >= 4 else (fallback_year or "")
 
-        poster_path = item.get("poster_path")
+        poster_path = item.get("poster_path") or item.get("backdrop_path")
         poster_url = (
             f"{TMDB_IMAGE_BASE}{poster_path}"
             if poster_path
@@ -147,6 +166,9 @@ class TmdbClient:
             rating = 0.0
 
         description = (item.get("overview") or "").strip() or "No description available."
+
+        orig_lang_code = str(item.get("original_language") or "").strip().lower()
+        original_language = TMDB_LANGUAGE_MAP.get(orig_lang_code)
 
         genre_ids = item.get("genre_ids") or []
         genres = [TMDB_GENRE_MAP[gid] for gid in genre_ids if gid in TMDB_GENRE_MAP]
@@ -164,6 +186,7 @@ class TmdbClient:
             rating=rating,
             description=description,
             category=category,
+            original_language=original_language,
             tmdb_id=item.get("id"),
             media_type=media_type,
             matched=True,
@@ -185,22 +208,28 @@ class TmdbClient:
                 rating=0.0,
                 description="No description available.",
                 category="Web Series" if prefer_tv else "Movie",
+                original_language=None,
                 tmdb_id=None,
                 media_type="tv" if prefer_tv else "movie",
                 matched=False,
             )
 
         order = ("tv", "movie") if prefer_tv else ("movie", "tv")
+        queries = [clean_query]
+        words = clean_query.split()
+        if len(words) > 3:
+            queries.append(" ".join(words[:3]))
 
-        for media_type in order:
-            if year:
-                results = await self._search(media_type, clean_query, year=year)
+        for query_variant in queries:
+            for media_type in order:
+                if year:
+                    results = await self._search(media_type, query_variant, year=year)
+                    if results:
+                        return self._map_result(results[0], media_type, clean_query, year)
+
+                results = await self._search(media_type, query_variant, year=None)
                 if results:
                     return self._map_result(results[0], media_type, clean_query, year)
-
-            results = await self._search(media_type, clean_query, year=None)
-            if results:
-                return self._map_result(results[0], media_type, clean_query, year)
 
         return TmdbMetadata(
             title=clean_query,
@@ -209,6 +238,7 @@ class TmdbClient:
             rating=0.0,
             description="No description available.",
             category="Web Series" if prefer_tv else "Movie",
+            original_language=None,
             tmdb_id=None,
             media_type="tv" if prefer_tv else "movie",
             matched=False,

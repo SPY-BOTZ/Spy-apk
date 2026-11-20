@@ -12,6 +12,7 @@ import procfile from '../../telegram-movie-bot/Procfile?raw';
 import runtimeTxt from '../../telegram-movie-bot/runtime.txt?raw';
 import envExample from '../../telegram-movie-bot/.env.example?raw';
 import readmeMd from '../../telegram-movie-bot/README.md?raw';
+import dockerfile from '../../telegram-movie-bot/Dockerfile?raw';
 
 export interface BotFileEntry {
   path: string;
@@ -126,6 +127,14 @@ export const BOT_FILES: BotFileEntry[] = [
     language: 'env',
     summary: 'Required environment variable template',
     content: envExample,
+  },
+  {
+    path: 'Dockerfile',
+    name: 'Dockerfile',
+    folder: 'root',
+    language: 'dockerfile',
+    summary: 'Python 3.11 container build for Koyeb deployment',
+    content: dockerfile,
   },
   {
     path: 'README.md',

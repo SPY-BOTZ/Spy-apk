@@ -152,10 +152,31 @@ def _build_selection_keyboard(pending: PendingUpload) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _infer_quality_from_message(msg: Optional[Message]) -> Optional[str]:
+    """Detect quality from Telegram video height/width metadata when filename lacks resolution."""
+    if not msg:
+        return None
+    video = getattr(msg, "video", None)
+    if not video:
+        return None
+    height = int(getattr(video, "height", 0) or 0)
+    width = int(getattr(video, "width", 0) or 0)
+    dim = max(height, round(width * 9 / 16)) if (height or width) else 0
+    if dim >= 2000:
+        return "4K"
+    if dim >= 1000:
+        return "1080p"
+    if dim >= 680:
+        return "720p"
+    if dim > 0:
+        return "480p"
+    return None
+
+
 def _build_post_save_keyboard(firebase_key: str, watch_url: str) -> InlineKeyboardMarkup:
-    lang_row = [
+    lang_buttons = [
         InlineKeyboardButton(lang, callback_data=f"upd_lang:{firebase_key}:{lang}")
-        for lang in SUPPORTED_LANGUAGES[:4]
+        for lang in SUPPORTED_LANGUAGES
     ]
     qual_row = [
         InlineKeyboardButton(qual, callback_data=f"upd_qual:{firebase_key}:{qual}")
@@ -166,7 +187,7 @@ def _build_post_save_keyboard(firebase_key: str, watch_url: str) -> InlineKeyboa
     ]
     if watch_url.startswith(("http://", "https://")) and "localhost" not in watch_url:
         action_row.insert(0, InlineKeyboardButton("▶ Watch Link", url=watch_url))
-    return InlineKeyboardMarkup([lang_row, qual_row, action_row])
+    return InlineKeyboardMarkup([lang_buttons[:3], lang_buttons[3:], qual_row, action_row])
 
 
 def _format_confirmation_text(
@@ -249,14 +270,31 @@ def register_handlers(
 
     async def _finalize_and_push(
         *,
-        status_msg: Message,
+        status_msg: Optional[Message],
+        reply_target: Optional[Message],
         tmdb_meta: TmdbMetadata,
         language: str,
         quality: str,
         file_id: str,
         message_id: int,
         direct_url: Optional[str] = None,
+        send_confirmation: bool = True,
     ) -> None:
+        if tmdb_meta.description == "No description available.":
+            year_suffix = f" ({tmdb_meta.year})" if tmdb_meta.year else ""
+            tmdb_meta = TmdbMetadata(
+                title=tmdb_meta.title,
+                year=tmdb_meta.year,
+                poster_url=tmdb_meta.poster_url,
+                rating=tmdb_meta.rating,
+                description=f"{tmdb_meta.title}{year_suffix} — {language} ({quality})",
+                category=tmdb_meta.category,
+                original_language=tmdb_meta.original_language,
+                tmdb_id=tmdb_meta.tmdb_id,
+                media_type=tmdb_meta.media_type,
+                matched=tmdb_meta.matched,
+            )
+
         record = build_movie_record(
             tmdb=tmdb_meta,
             language=language,
@@ -270,16 +308,40 @@ def register_handlers(
             firebase_key = await firebase.push_movie(record)
         except FirebaseError as exc:
             logger.error("Firebase push failed: %s", exc)
-            await status_msg.edit_text(f"❌ **Firebase Upload Failed**\n`{exc}`")
+            if status_msg:
+                await status_msg.edit_text(f"❌ **Firebase Upload Failed**\n`{exc}`")
+            return
+
+        if not send_confirmation:
+            logger.info("Auto-cataloged %r -> Firebase key %s", record["title"], firebase_key)
             return
 
         text = _format_confirmation_text(record, firebase_key, tmdb_meta.matched)
         keyboard = _build_post_save_keyboard(firebase_key, record["watchLink"])
-        await status_msg.edit_text(
-            text,
-            reply_markup=keyboard,
-            disable_web_page_preview=False,
-        )
+
+        if reply_target and record["posterUrl"].startswith(("http://", "https://")):
+            try:
+                await reply_target.reply_photo(
+                    photo=record["posterUrl"],
+                    caption=text[:1024],
+                    reply_markup=keyboard,
+                    quote=True,
+                )
+                if status_msg:
+                    try:
+                        await status_msg.delete()
+                    except RPCError:
+                        pass
+                return
+            except RPCError as exc:
+                logger.debug("reply_photo fallback to text confirmation: %s", exc)
+
+        if status_msg:
+            await status_msg.edit_text(
+                text,
+                reply_markup=keyboard,
+                disable_web_page_preview=False,
+            )
 
     # ------------------------------------------------------------------
     # /start & /help
@@ -450,18 +512,22 @@ def register_handlers(
 
     async def _process_incoming_media(
         *,
-        reply_target: Message,
+        reply_target: Optional[Message],
         media_message: Optional[Message],
         raw_filename: Optional[str],
         raw_caption: Optional[str],
         direct_url: Optional[str] = None,
+        silent_channel_mode: bool = False,
     ) -> None:
         _prune_expired_pending()
         parsed = parse_media_metadata(filename=raw_filename, caption=raw_caption)
-        status_msg = await reply_target.reply_text(
-            f"🔎 Parsing `{parsed.title}`{f' ({parsed.year})' if parsed.year else ''} & fetching TMDB metadata...",
-            quote=True,
-        )
+
+        status_msg: Optional[Message] = None
+        if reply_target and not silent_channel_mode:
+            status_msg = await reply_target.reply_text(
+                f"🔎 Parsing `{parsed.title}`{f' ({parsed.year})' if parsed.year else ''} & fetching TMDB metadata...",
+                quote=True,
+            )
 
         tmdb_meta = await tmdb.lookup(
             parsed.title,
@@ -472,50 +538,29 @@ def register_handlers(
         if media_message is not None:
             file_id, storage_msg_id = await _copy_to_storage(media_message)
         else:
-            file_id, storage_msg_id = "", reply_target.id
+            file_id, storage_msg_id = "", (reply_target.id if reply_target else 0)
 
-        # If both language and quality were confidently extracted, push immediately!
-        if not parsed.needs_selection and parsed.language and parsed.quality:
-            await _finalize_and_push(
-                status_msg=status_msg,
-                tmdb_meta=tmdb_meta,
-                language=parsed.language,
-                quality=parsed.quality,
-                file_id=file_id,
-                message_id=storage_msg_id,
-                direct_url=direct_url,
-            )
-            return
+        resolved_language = parsed.language or tmdb_meta.original_language or "Hindi"
+        resolved_quality = (
+            parsed.quality
+            or _infer_quality_from_message(media_message)
+            or "720p"
+        )
 
-        # Otherwise present interactive selection buttons for missing language/quality
-        token = uuid.uuid4().hex[:10]
-        admin_id = reply_target.from_user.id if reply_target.from_user else settings.owner_id
-        pending = PendingUpload(
-            token=token,
-            admin_id=admin_id,
-            chat_id=reply_target.chat.id,
-            parsed=parsed,
-            tmdb=tmdb_meta,
+        # Immediately push to Firebase so poster, description, rating, and language appear on the APK automatically
+        await _finalize_and_push(
+            status_msg=status_msg,
+            reply_target=reply_target,
+            tmdb_meta=tmdb_meta,
+            language=resolved_language,
+            quality=resolved_quality,
             file_id=file_id,
             message_id=storage_msg_id,
             direct_url=direct_url,
-            language=parsed.language or "Hindi",
-            quality=parsed.quality or "720p",
-        )
-        pending_uploads[token] = pending
-
-        year_part = f" ({tmdb_meta.year})" if tmdb_meta.year else ""
-        await status_msg.edit_text(
-            f"🎬 **{tmdb_meta.title}{year_part}**\n"
-            f"⭐ Rating: `{tmdb_meta.rating}` | 🏷 Category: `{tmdb_meta.category}`\n\n"
-            f"Some metadata tags were not explicit in the filename.\n"
-            f"Select **Language** and **Quality** below, then tap **Save to Firebase**:\n"
-            f"• Current Language: **{pending.language}**\n"
-            f"• Current Quality: **{pending.quality}**",
-            reply_markup=_build_selection_keyboard(pending),
+            send_confirmation=not silent_channel_mode,
         )
 
-    @app.on_message(filters.video | filters.document)
+    @app.on_message((filters.video | filters.document) & ~filters.channel)
     async def handle_media_upload(client: Client, message: Message) -> None:
         if not await _require_admin(message):
             return
@@ -527,6 +572,23 @@ def register_handlers(
             media_message=message,
             raw_filename=file_name,
             raw_caption=message.caption,
+        )
+
+    @app.on_message(
+        filters.channel
+        & filters.chat(settings.storage_channel_id)
+        & (filters.video | filters.document)
+        & ~filters.outgoing
+    )
+    async def handle_storage_channel_post(client: Client, message: Message) -> None:
+        media = message.video or message.document
+        file_name = getattr(media, "file_name", None)
+        await _process_incoming_media(
+            reply_target=None,
+            media_message=message,
+            raw_filename=file_name,
+            raw_caption=message.caption,
+            silent_channel_mode=True,
         )
 
     @app.on_message(
@@ -626,6 +688,7 @@ def register_handlers(
                 await query.answer("Saving to Firebase...")
                 await _finalize_and_push(
                     status_msg=query.message,
+                    reply_target=None,
                     tmdb_meta=pending.tmdb,
                     language=pending.language or "Hindi",
                     quality=pending.quality or "720p",
@@ -679,11 +742,16 @@ def register_handlers(
 
             updated = {**existing, **patch}
             await query.answer(f"Updated to {new_value}")
-            await query.message.edit_text(
-                _format_confirmation_text(updated, firebase_key, True),
-                reply_markup=_build_post_save_keyboard(firebase_key, updated.get("watchLink", "")),
-                disable_web_page_preview=False,
-            )
+            new_text = _format_confirmation_text(updated, firebase_key, True)
+            new_markup = _build_post_save_keyboard(firebase_key, updated.get("watchLink", ""))
+            if query.message.photo:
+                await query.message.edit_caption(caption=new_text[:1024], reply_markup=new_markup)
+            else:
+                await query.message.edit_text(
+                    new_text,
+                    reply_markup=new_markup,
+                    disable_web_page_preview=False,
+                )
             return
 
         if action == "del_entry" and len(parts) == 2:
@@ -694,4 +762,8 @@ def register_handlers(
                 await query.answer(f"Delete failed: {exc}", show_alert=True)
                 return
             await query.answer("Deleted from Firebase")
-            await query.message.edit_text(f"🗑 Deleted Firebase record `{firebase_key}`.")
+            deleted_msg = f"🗑 Deleted Firebase record `{firebase_key}`."
+            if query.message.photo:
+                await query.message.edit_caption(caption=deleted_msg)
+            else:
+                await query.message.edit_text(deleted_msg)
