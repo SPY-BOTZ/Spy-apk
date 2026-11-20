@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from bot.parser import parse_media_metadata
 from bot.streamer import FastByteStreamer
 
 if TYPE_CHECKING:
@@ -182,6 +183,8 @@ class BotWebServer:
         raw_file_name: Optional[str] = None
         safe_file_name = f"Stream #{msg_id}"
         size_label = ""
+        parsed_lang = ""
+        parsed_qual = ""
         if self._tg_client and getattr(self._tg_client, "is_connected", False):
             try:
                 msg = await self._get_cached_message(msg_id)
@@ -192,6 +195,12 @@ class BotWebServer:
                         safe_file_name = html.escape(file_name)
                     if file_size > 0:
                         size_label = _format_size(file_size)
+                    parsed = parse_media_metadata(
+                        filename=raw_file_name,
+                        caption=getattr(msg, "caption", None),
+                    )
+                    parsed_lang = parsed.language or ""
+                    parsed_qual = parsed.quality or ""
             except Exception as exc:
                 logger.debug("Could not fetch metadata for watch page %s: %s", msg_id, exc)
 
@@ -210,6 +219,14 @@ class BotWebServer:
         encoded_title = quote(raw_file_name or f"Stream {msg_id}")
         mx_url = f"intent:{stream_abs_url}#Intent;package=com.mxtech.videoplayer.ad;S.title={encoded_title};end"
         meta_line = f"{safe_file_name} &middot; {size_label}" if size_label else safe_file_name
+        tag_items: list[str] = []
+        if parsed_lang:
+            tag_items.append(f'<span class="tag-lang">{html.escape(parsed_lang)}</span>')
+        if parsed_qual:
+            tag_items.append(f'<span class="tag-qual">{html.escape(parsed_qual)}</span>')
+        if size_label:
+            tag_items.append(f'<span class="tag-size">{html.escape(size_label)}</span>')
+        tags_html = f'<div class="media-tags">{"".join(tag_items)}</div>' if tag_items else ""
 
         page = f"""<!doctype html>
 <html lang="en">
@@ -237,6 +254,29 @@ class BotWebServer:
       flex-direction: column;
       align-items: center;
     }}
+    .top-nav {{
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 14px;
+    }}
+    .nav-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      background: #141b2d;
+      color: #e2e8f0;
+      border: 1px solid #26324d;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+    }}
+    .nav-btn:hover {{ background: #1e293b; }}
     .brand {{
       display: flex;
       flex-direction: column;
@@ -261,11 +301,47 @@ class BotWebServer:
       color: #ffffff;
     }}
     .file-subtitle {{
-      font-size: 0.875rem;
-      color: #94a3b8;
-      margin: 6px 0 0;
+      font-size: 0.9rem;
+      color: #cbd5e1;
+      margin: 8px 0 0;
       word-break: break-word;
       max-width: 680px;
+      font-weight: 600;
+    }}
+    .media-tags {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .tag-lang {{
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: rgba(37, 99, 235, 0.22);
+      border: 1px solid rgba(96, 165, 250, 0.45);
+      color: #93c5fd;
+      font-size: 0.95rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }}
+    .tag-qual {{
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: rgba(251, 191, 36, 0.16);
+      border: 1px solid rgba(251, 191, 36, 0.4);
+      color: #fcd34d;
+      font-size: 0.9rem;
+      font-weight: 700;
+    }}
+    .tag-size {{
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: #141b2d;
+      border: 1px solid #26324d;
+      color: #cbd5e1;
+      font-size: 0.85rem;
+      font-weight: 600;
     }}
     .player-shell {{
       width: 100%;
@@ -379,10 +455,16 @@ class BotWebServer:
 </head>
 <body>
   <div class="wrap">
+    <div class="top-nav">
+      <button type="button" class="nav-btn" onclick="if (window.history.length > 1) {{ window.history.back(); }} else {{ window.location.href = '/'; }}">&larr; Back</button>
+      <a class="nav-btn" href="{TELEGRAM_CHANNEL_URL}" target="_blank" rel="noopener noreferrer">&#127968; SPY MOVIE BOTZ Home</a>
+    </div>
+
     <div class="brand">
       <img class="logo" src="/assets/logo.png" alt="SPY MOVIE BOTZ" />
       <h1 class="brand-title">SPY MOVIE BOTZ</h1>
       <p class="file-subtitle">{meta_line}</p>
+      {tags_html}
     </div>
 
     <div class="player-shell">

@@ -80,8 +80,8 @@ def _quality_badge(quality: str) -> str:
 
 
 def format_apk_badge(language: str, quality: str) -> str:
-    """Format poster card badge so APK users immediately see Language + Quality."""
-    return f"{language} • {quality} • {_quality_badge(quality)}"
+    """Format poster card badge with prominent Language + short badge (APK prepends resolution)."""
+    return f"{language.upper()} • {_quality_badge(quality)}"
 
 
 def format_apk_description(base_description: str, language: str, quality: str) -> str:

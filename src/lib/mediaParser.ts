@@ -161,7 +161,7 @@ export function buildFirebasePayloadPreview(params: {
     posterUrl: 'https://image.tmdb.org/t/p/w500/example_poster.jpg',
     category: params.isSeries ? 'Web Series' : 'Sci-Fi',
     rating: 8.4,
-    qualityBadge: `${params.language} • ${params.quality} • ${shortBadge}`,
+    qualityBadge: `${params.language.toUpperCase()} • ${shortBadge}`,
     language: params.language,
     quality: params.quality,
     cast: 'Actor One, Actor Two, Actor Three',
