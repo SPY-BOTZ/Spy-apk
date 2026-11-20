@@ -51,6 +51,78 @@ class PendingUpload:
     created_ts: float = field(default_factory=time.monotonic)
 
 
+class SendMediaLimiter:
+    """Adaptive rate limiter for Telegram `messages.SendMedia` calls across bulk uploads & /dl cards."""
+
+    def __init__(self, base_gap: float = 1.4, max_gap: float = 3.8) -> None:
+        self._base_gap = base_gap
+        self._max_gap = max_gap
+        self.adaptive_gap = base_gap
+        self._lock = asyncio.Lock()
+        self._last_send_ts = 0.0
+        self._cooldown_until = 0.0
+        self.flood_wait_events = 0
+
+    def is_busy_or_cooling(self) -> bool:
+        return (
+            self._lock.locked()
+            or time.monotonic() < self._cooldown_until
+            or self.adaptive_gap >= 2.2
+        )
+
+    async def execute(
+        self,
+        coro_factory: Any,
+        *,
+        min_gap: Optional[float] = None,
+        max_attempts: int = 5,
+        fallback_on_flood: bool = False,
+    ) -> Any:
+        if fallback_on_flood and self.is_busy_or_cooling():
+            raise FloodWait(value=1)
+
+        async with self._lock:
+            for attempt in range(max_attempts):
+                now = time.monotonic()
+                target_gap = max(self.adaptive_gap, min_gap or 0.0)
+                wait_for_gap = (self._last_send_ts + target_gap) - now
+                wait_for_cooldown = self._cooldown_until - now
+                sleep_for = max(wait_for_gap, wait_for_cooldown, 0.0)
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+
+                started = time.monotonic()
+                try:
+                    result = await coro_factory()
+                    elapsed = time.monotonic() - started
+                    finished = time.monotonic()
+                    self._last_send_ts = finished
+                    if elapsed >= 4.5:
+                        self.flood_wait_events += 1
+                        self.adaptive_gap = min(self._max_gap, self.adaptive_gap + 0.6)
+                    else:
+                        self.adaptive_gap = max(self._base_gap, self.adaptive_gap - 0.15)
+                    return result
+                except FloodWait as wait_exc:
+                    wait_secs = float(getattr(wait_exc, "value", 5) or 5) + 1.0
+                    self.flood_wait_events += 1
+                    self.adaptive_gap = min(self._max_gap, max(self.adaptive_gap + 0.8, 2.5))
+                    self._cooldown_until = time.monotonic() + wait_secs
+                    if fallback_on_flood or attempt == max_attempts - 1:
+                        raise
+                    logger.warning(
+                        "Telegram FloodWait during SendMedia (attempt %d/%d): sleeping %.1fs (gap=%.1fs)",
+                        attempt + 1,
+                        max_attempts,
+                        wait_secs,
+                        self.adaptive_gap,
+                    )
+                    await asyncio.sleep(wait_secs)
+                    self._last_send_ts = time.monotonic()
+
+            return await coro_factory()
+
+
 def _format_uptime(seconds: float) -> str:
     total = max(0, int(seconds))
     days, rem = divmod(total, 86400)
@@ -377,42 +449,18 @@ def register_handlers(
         )
 
     pending_uploads: dict[str, PendingUpload] = {}
-    send_media_lock = asyncio.Lock()
-    last_send_media_ts = 0.0
-
-    async def _run_paced_send_media(coro_factory: Any, min_gap: float = 1.1) -> Any:
-        """Serialize SendMedia calls (copy & reply_photo) with pacing + FloodWait retries."""
-        nonlocal last_send_media_ts
-        async with send_media_lock:
-            for attempt in range(4):
-                elapsed = time.monotonic() - last_send_media_ts
-                if elapsed < min_gap:
-                    await asyncio.sleep(min_gap - elapsed)
-                try:
-                    result = await coro_factory()
-                    last_send_media_ts = time.monotonic()
-                    return result
-                except FloodWait as wait_exc:
-                    wait_secs = float(getattr(wait_exc, "value", 5) or 5) + 1.0
-                    logger.warning(
-                        "Telegram FloodWait during SendMedia (attempt %d/4): sleeping %.1fs",
-                        attempt + 1,
-                        wait_secs,
-                    )
-                    await asyncio.sleep(wait_secs)
-                    last_send_media_ts = time.monotonic()
-            # Final attempt after max FloodWait waits
-            result = await coro_factory()
-            last_send_media_ts = time.monotonic()
-            return result
+    media_limiter = SendMediaLimiter()
+    upload_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    upload_worker_task: Optional[asyncio.Task[None]] = None
+    storage_channel_sem = asyncio.Semaphore(4)
 
     async def _run_with_floodwait(coro_factory: Any) -> Any:
         """Retry non-SendMedia Telegram RPCs on FloodWait without crashing bulk uploads."""
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 return await coro_factory()
             except FloodWait as wait_exc:
-                if attempt == 3:
+                if attempt == 4:
                     raise
                 wait_secs = float(getattr(wait_exc, "value", 3) or 3) + 1.0
                 logger.warning("Telegram FloodWait on RPC: sleeping %.1fs", wait_secs)
@@ -437,7 +485,7 @@ def register_handlers(
             )
         return False
 
-    async def _copy_to_storage(msg: Message) -> tuple[str, int]:
+    async def _copy_to_storage(msg: Message, *, bulk_mode: bool = False) -> tuple[str, int]:
         """Copy media message into STORAGE_CHANNEL_ID cleanly without triggering FloodWait storms."""
         media = msg.video or msg.document
         file_id = getattr(media, "file_id", "") if media else ""
@@ -446,8 +494,9 @@ def register_handlers(
             return file_id, msg.id
 
         try:
-            copied = await _run_paced_send_media(
-                lambda: msg.copy(settings.storage_channel_id)
+            copied = await media_limiter.execute(
+                lambda: msg.copy(settings.storage_channel_id),
+                min_gap=2.4 if bulk_mode else 1.4,
             )
             return file_id, copied.id
         except RPCError as exc:
@@ -472,6 +521,7 @@ def register_handlers(
         direct_url: Optional[str] = None,
         file_name: Optional[str] = None,
         send_confirmation: bool = True,
+        prefer_text_confirmation: bool = False,
     ) -> None:
         if tmdb_meta.description == "No description available.":
             tmdb_meta = TmdbMetadata(
@@ -528,15 +578,22 @@ def register_handlers(
             record["downloadLink"],
         )
 
-        if reply_target and record["posterUrl"].startswith(("http://", "https://")):
+        use_photo = (
+            not prefer_text_confirmation
+            and not media_limiter.is_busy_or_cooling()
+            and reply_target is not None
+            and record["posterUrl"].startswith(("http://", "https://"))
+        )
+        if use_photo and reply_target is not None:
             try:
-                await _run_paced_send_media(
+                await media_limiter.execute(
                     lambda: reply_target.reply_photo(
                         photo=record["posterUrl"],
                         caption=text[:1024],
                         reply_markup=keyboard,
                         quote=True,
-                    )
+                    ),
+                    fallback_on_flood=True,
                 )
                 if status_msg:
                     try:
@@ -558,16 +615,32 @@ def register_handlers(
                 )
             except RPCError as exc:
                 logger.warning("Failed to edit confirmation status message: %s", exc)
+        elif reply_target:
+            try:
+                await _run_with_floodwait(
+                    lambda: reply_target.reply_text(
+                        text,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=False,
+                        quote=True,
+                    )
+                )
+            except RPCError as exc:
+                logger.warning("Failed to send text confirmation message: %s", exc)
 
     async def _send_user_download_card(message: Message, firebase_key: str) -> None:
         try:
             movie = await firebase.get_movie(firebase_key)
         except FirebaseError as exc:
-            await message.reply_text(f"❌ Could not fetch movie: `{exc}`", quote=True)
+            await _run_with_floodwait(
+                lambda: message.reply_text(f"❌ Could not fetch movie: `{exc}`", quote=True)
+            )
             return
 
         if not movie:
-            await message.reply_text("❌ Movie not found or was removed.", quote=True)
+            await _run_with_floodwait(
+                lambda: message.reply_text("❌ Movie not found or was removed.", quote=True)
+            )
             return
 
         title = str(movie.get("title") or "Movie")
@@ -598,18 +671,28 @@ def register_handlers(
         )
         keyboard = _build_user_download_keyboard(watch_url, download_url)
         poster = str(movie.get("posterUrl") or "")
-        if poster.startswith(("http://", "https://")):
+        if poster.startswith(("http://", "https://")) and not media_limiter.is_busy_or_cooling():
             try:
-                await message.reply_photo(
-                    photo=poster,
-                    caption=caption[:1024],
-                    reply_markup=keyboard,
-                    quote=True,
+                await media_limiter.execute(
+                    lambda: message.reply_photo(
+                        photo=poster,
+                        caption=caption[:1024],
+                        reply_markup=keyboard,
+                        quote=True,
+                    ),
+                    fallback_on_flood=True,
                 )
                 return
             except RPCError:
                 pass
-        await message.reply_text(caption, reply_markup=keyboard, quote=True)
+        await _run_with_floodwait(
+            lambda: message.reply_text(
+                caption,
+                reply_markup=keyboard,
+                disable_web_page_preview=False,
+                quote=True,
+            )
+        )
 
     # ------------------------------------------------------------------
     # /start, /help & /dl
@@ -636,8 +719,9 @@ def register_handlers(
                 f"Your Role: **{role}** (`{uid}`)\n\n"
                 f"**Admin Commands:**\n"
                 f"• Send or forward any video/document file or link to auto-catalog to Firebase\n"
+                f"• **Bulk Tip:** Post/forward batches directly into `STORAGE_CHANNEL_ID` for instant cataloging with zero SendMedia limits (PM bulk batches auto-queue safely)\n"
                 f"• `/dl <firebase_key>` — Get Direct Download buttons for any cataloged movie\n"
-                f"• `/status` — Bot, Firebase, TMDB & Koyeb server health\n"
+                f"• `/status` — Bot, Firebase, TMDB, Queue & Rate-Limit status\n"
                 f"• `/inspectdb` — Check Firebase nodes, movie count & APK schema types\n"
                 f"• `/addadmin <user_id>` (or reply) — Authorize an admin\n"
                 f"• `/removeadmin <user_id>` (or reply) — Revoke an admin\n"
@@ -730,6 +814,8 @@ def register_handlers(
             f"🎞 **TMDB API:** {tmdb_badge}\n"
             f"👮 **Total Admins:** `{firebase.total_admins_count()}`\n"
             f"🎬 **Movies in Firebase:** `{movie_count}`\n"
+            f"📦 **Upload Queue:** `{upload_queue.qsize()}` pending\n"
+            f"🚦 **SendMedia Pacing:** `{media_limiter.adaptive_gap:.1f}s` (FloodWaits: `{media_limiter.flood_wait_events}`)\n"
             f"🌐 **HTTP Server:** `0.0.0.0:{settings.port}` (Active)\n"
             f"🔗 **Stream Base URL:** `{settings.base_url}`"
         )
@@ -854,12 +940,13 @@ def register_handlers(
         raw_caption: Optional[str],
         direct_url: Optional[str] = None,
         silent_channel_mode: bool = False,
+        bulk_mode: bool = False,
     ) -> None:
         _prune_expired_pending()
         parsed = parse_media_metadata(filename=raw_filename, caption=raw_caption)
 
         status_msg: Optional[Message] = None
-        if reply_target and not silent_channel_mode:
+        if reply_target and not silent_channel_mode and not bulk_mode:
             try:
                 status_msg = await _run_with_floodwait(
                     lambda: reply_target.reply_text(
@@ -877,7 +964,10 @@ def register_handlers(
         )
 
         if media_message is not None:
-            file_id, storage_msg_id = await _copy_to_storage(media_message)
+            file_id, storage_msg_id = await _copy_to_storage(
+                media_message,
+                bulk_mode=bulk_mode,
+            )
         else:
             file_id, storage_msg_id = "", (reply_target.id if reply_target else 0)
 
@@ -900,7 +990,25 @@ def register_handlers(
             direct_url=direct_url,
             file_name=raw_filename,
             send_confirmation=not silent_channel_mode,
+            prefer_text_confirmation=bulk_mode,
         )
+
+    async def _upload_worker_loop() -> None:
+        while True:
+            job = await upload_queue.get()
+            try:
+                bulk_mode = upload_queue.qsize() > 0 or media_limiter.is_busy_or_cooling()
+                await _process_incoming_media(bulk_mode=bulk_mode, **job)
+            except Exception as exc:
+                logger.exception("Unhandled error in bulk upload worker: %s", exc)
+            finally:
+                upload_queue.task_done()
+
+    def _enqueue_upload(job: dict[str, Any]) -> None:
+        nonlocal upload_worker_task
+        upload_queue.put_nowait(job)
+        if upload_worker_task is None or upload_worker_task.done():
+            upload_worker_task = asyncio.create_task(_upload_worker_loop())
 
     @app.on_message((filters.video | filters.document) & ~filters.channel)
     async def handle_media_upload(client: Client, message: Message) -> None:
@@ -909,11 +1017,13 @@ def register_handlers(
 
         media = message.video or message.document
         file_name = getattr(media, "file_name", None)
-        await _process_incoming_media(
-            reply_target=message,
-            media_message=message,
-            raw_filename=file_name,
-            raw_caption=message.caption,
+        _enqueue_upload(
+            {
+                "reply_target": message,
+                "media_message": message,
+                "raw_filename": file_name,
+                "raw_caption": message.caption,
+            }
         )
 
     @app.on_message(
@@ -925,13 +1035,14 @@ def register_handlers(
     async def handle_storage_channel_post(client: Client, message: Message) -> None:
         media = message.video or message.document
         file_name = getattr(media, "file_name", None)
-        await _process_incoming_media(
-            reply_target=None,
-            media_message=message,
-            raw_filename=file_name,
-            raw_caption=message.caption,
-            silent_channel_mode=True,
-        )
+        async with storage_channel_sem:
+            await _process_incoming_media(
+                reply_target=None,
+                media_message=message,
+                raw_filename=file_name,
+                raw_caption=message.caption,
+                silent_channel_mode=True,
+            )
 
     @app.on_message(
         filters.text
@@ -965,11 +1076,13 @@ def register_handlers(
 
             media = fetched.video or fetched.document
             if media:
-                await _process_incoming_media(
-                    reply_target=message,
-                    media_message=fetched,
-                    raw_filename=getattr(media, "file_name", None),
-                    raw_caption=fetched.caption or text,
+                _enqueue_upload(
+                    {
+                        "reply_target": message,
+                        "media_message": fetched,
+                        "raw_filename": getattr(media, "file_name", None),
+                        "raw_caption": fetched.caption or text,
+                    }
                 )
                 return
 

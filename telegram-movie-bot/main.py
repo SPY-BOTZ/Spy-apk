@@ -72,7 +72,7 @@ async def run_bot() -> None:
         in_memory=True,
         workers=16,
         max_concurrent_transmissions=8,
-        sleep_threshold=30,
+        sleep_threshold=10,
     )
     register_handlers(
         app=tg_client,
@@ -88,8 +88,9 @@ async def run_bot() -> None:
     loop = asyncio.get_running_loop()
 
     def _request_shutdown(sig_name: str) -> None:
-        logger.info("Received %s, initiating graceful shutdown...", sig_name)
-        stop_event.set()
+        if not stop_event.is_set():
+            logger.info("Received %s, initiating graceful shutdown...", sig_name)
+            stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:

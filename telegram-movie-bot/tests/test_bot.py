@@ -185,5 +185,29 @@ class ApkLanguageFormattingTests(unittest.TestCase):
         )
 
 
+class SendMediaLimiterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_adaptive_backoff_and_fallback_on_flood(self) -> None:
+        from pyrogram.errors import FloodWait
+        from bot.handlers import SendMediaLimiter
+
+        limiter = SendMediaLimiter(base_gap=0.01, max_gap=3.8)
+        calls = 0
+
+        async def flaky_call() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise FloodWait(value=0)
+            return "ok"
+
+        res = await limiter.execute(flaky_call, min_gap=0.01, max_attempts=3)
+        self.assertEqual(res, "ok")
+        self.assertEqual(limiter.flood_wait_events, 1)
+        self.assertTrue(limiter.is_busy_or_cooling())
+
+        with self.assertRaises(FloodWait):
+            await limiter.execute(flaky_call, fallback_on_flood=True)
+
+
 if __name__ == "__main__":
     unittest.main()
