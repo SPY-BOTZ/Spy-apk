@@ -21,6 +21,7 @@ from pyrogram.types import (
 
 from bot.config import Settings
 from bot.firebase_client import FirebaseClient, FirebaseError
+from bot.link_generator import SpeedLinkGenerator
 from bot.parser import (
     SUPPORTED_LANGUAGES,
     SUPPORTED_QUALITIES,
@@ -83,10 +84,20 @@ def build_movie_record(
     message_id: int,
     base_url: str,
     direct_url: Optional[str] = None,
+    file_name: Optional[str] = None,
+    link_generator: Optional[SpeedLinkGenerator] = None,
     schema_profile: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build the Firebase `/movies` schema record aligned with existing DB types."""
-    if direct_url:
+    if link_generator is not None:
+        links = link_generator.generate(
+            message_id=message_id,
+            file_name=file_name or f"{tmdb.title}.{tmdb.year or 'movie'}.mp4",
+            direct_url=direct_url,
+        )
+        watch_url = links.watch_url
+        download_url = links.direct_download_url
+    elif direct_url:
         watch_url = direct_url
         download_url = direct_url
     else:
@@ -261,7 +272,20 @@ def _infer_quality_from_message(msg: Optional[Message], is_series: bool = False)
     return None
 
 
-def _build_post_save_keyboard(firebase_key: str, watch_url: str) -> InlineKeyboardMarkup:
+def _build_user_download_keyboard(watch_url: str, download_url: str) -> Optional[InlineKeyboardMarkup]:
+    row: list[InlineKeyboardButton] = []
+    if download_url.startswith(("http://", "https://")) and "localhost" not in download_url:
+        row.append(InlineKeyboardButton("⚡ Direct Download", url=download_url))
+    if watch_url.startswith(("http://", "https://")) and "localhost" not in watch_url:
+        row.append(InlineKeyboardButton("▶ Watch Online", url=watch_url))
+    return InlineKeyboardMarkup([row]) if row else None
+
+
+def _build_post_save_keyboard(
+    firebase_key: str,
+    watch_url: str,
+    download_url: str = "",
+) -> InlineKeyboardMarkup:
     lang_buttons = [
         InlineKeyboardButton(lang, callback_data=f"upd_lang:{firebase_key}:{lang}")
         for lang in SUPPORTED_LANGUAGES
@@ -270,12 +294,17 @@ def _build_post_save_keyboard(firebase_key: str, watch_url: str) -> InlineKeyboa
         InlineKeyboardButton(qual, callback_data=f"upd_qual:{firebase_key}:{qual}")
         for qual in SUPPORTED_QUALITIES
     ]
-    action_row = [
-        InlineKeyboardButton("🗑 Delete Entry", callback_data=f"del_entry:{firebase_key}"),
-    ]
+    links_row: list[InlineKeyboardButton] = []
+    if download_url.startswith(("http://", "https://")) and "localhost" not in download_url:
+        links_row.append(InlineKeyboardButton("⚡ Direct Download", url=download_url))
     if watch_url.startswith(("http://", "https://")) and "localhost" not in watch_url:
-        action_row.insert(0, InlineKeyboardButton("▶ Watch Link", url=watch_url))
-    return InlineKeyboardMarkup([lang_buttons[:3], lang_buttons[3:], qual_row, action_row])
+        links_row.append(InlineKeyboardButton("▶ Watch Link", url=watch_url))
+
+    rows = [lang_buttons[:3], lang_buttons[3:], qual_row]
+    if links_row:
+        rows.append(links_row)
+    rows.append([InlineKeyboardButton("🗑 Delete Entry", callback_data=f"del_entry:{firebase_key}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _format_confirmation_text(
@@ -313,8 +342,16 @@ def register_handlers(
     firebase: FirebaseClient,
     tmdb: TmdbClient,
     start_time: float,
+    link_generator: Optional[SpeedLinkGenerator] = None,
 ) -> None:
     """Attach all command, upload, and callback handlers to the Pyrogram client."""
+
+    if link_generator is None:
+        link_generator = SpeedLinkGenerator(
+            bot_token=settings.bot_token,
+            api_hash=settings.api_hash,
+            base_url=settings.base_url,
+        )
 
     pending_uploads: dict[str, PendingUpload] = {}
 
@@ -370,6 +407,7 @@ def register_handlers(
         file_id: str,
         message_id: int,
         direct_url: Optional[str] = None,
+        file_name: Optional[str] = None,
         send_confirmation: bool = True,
     ) -> None:
         if tmdb_meta.description == "No description available.":
@@ -385,6 +423,8 @@ def register_handlers(
                 tmdb_id=tmdb_meta.tmdb_id,
                 media_type=tmdb_meta.media_type,
                 matched=tmdb_meta.matched,
+                cast=tmdb_meta.cast,
+                genres=tmdb_meta.genres,
             )
 
         try:
@@ -400,6 +440,8 @@ def register_handlers(
             message_id=message_id,
             base_url=settings.base_url,
             direct_url=direct_url,
+            file_name=file_name,
+            link_generator=link_generator,
             schema_profile=schema_profile,
         )
         try:
@@ -418,7 +460,11 @@ def register_handlers(
             return
 
         text = _format_confirmation_text(record, firebase_key, tmdb_meta.matched)
-        keyboard = _build_post_save_keyboard(firebase_key, record["watchLink"])
+        keyboard = _build_post_save_keyboard(
+            firebase_key,
+            record["watchLink"],
+            record["downloadLink"],
+        )
 
         if reply_target and record["posterUrl"].startswith(("http://", "https://")):
             try:
@@ -444,30 +490,106 @@ def register_handlers(
                 disable_web_page_preview=False,
             )
 
+    async def _send_user_download_card(message: Message, firebase_key: str) -> None:
+        try:
+            movie = await firebase.get_movie(firebase_key)
+        except FirebaseError as exc:
+            await message.reply_text(f"❌ Could not fetch movie: `{exc}`", quote=True)
+            return
+
+        if not movie:
+            await message.reply_text("❌ Movie not found or was removed.", quote=True)
+            return
+
+        title = str(movie.get("title") or "Movie")
+        year = str(movie.get("year") or "")
+        year_part = f" ({year})" if year else ""
+        lang = str(movie.get("language") or "Hindi")
+        qual = str(movie.get("quality") or "HD")
+        rating = movie.get("rating", 0.0)
+        desc = str(movie.get("description") or "")
+        if len(desc) > 200:
+            desc = f"{desc[:197]}..."
+
+        msg_id_raw = movie.get("messageId")
+        watch_url = str(movie.get("watchLink") or "")
+        download_url = str(movie.get("downloadLink") or "")
+        if isinstance(msg_id_raw, int) or (isinstance(msg_id_raw, str) and msg_id_raw.isdigit()):
+            mid = int(msg_id_raw)
+            if "/dl/" not in download_url and not download_url.startswith(("http://", "https://")):
+                links = link_generator.generate(message_id=mid, file_name=f"{title}.{year or 'hd'}.mp4")
+                download_url = links.direct_download_url
+                watch_url = watch_url or links.watch_url
+
+        caption = (
+            f"🎬 **{title}{year_part}**\n"
+            f"⭐ **Rating:** `{rating}` | 🌐 **Language:** {lang} | 🎞 **Quality:** {qual}\n\n"
+            f"{desc}\n\n"
+            f"Tap **⚡ Direct Download** below for high-speed download."
+        )
+        keyboard = _build_user_download_keyboard(watch_url, download_url)
+        poster = str(movie.get("posterUrl") or "")
+        if poster.startswith(("http://", "https://")):
+            try:
+                await message.reply_photo(
+                    photo=poster,
+                    caption=caption[:1024],
+                    reply_markup=keyboard,
+                    quote=True,
+                )
+                return
+            except RPCError:
+                pass
+        await message.reply_text(caption, reply_markup=keyboard, quote=True)
+
     # ------------------------------------------------------------------
-    # /start & /help
+    # /start, /help & /dl
     # ------------------------------------------------------------------
 
     @app.on_message(filters.command(["start", "help"]))
     async def cmd_start(client: Client, message: Message) -> None:
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) == 2 and args[1].strip().startswith("dl_"):
+            fkey = args[1].strip()[3:]
+            if fkey:
+                await _send_user_download_card(message, fkey)
+                return
+
         uid = message.from_user.id if message.from_user else None
         role = (
             "Super Admin (Owner)"
             if firebase.is_owner(uid)
-            else ("Admin" if firebase.is_admin(uid) else "Unauthorized")
+            else ("Admin" if firebase.is_admin(uid) else "User")
         )
+        if firebase.is_admin(uid):
+            await message.reply_text(
+                f"🎬 **SPY MOVIE BOTZ — Catalog Bot**\n"
+                f"Your Role: **{role}** (`{uid}`)\n\n"
+                f"**Admin Commands:**\n"
+                f"• Send or forward any video/document file or link to auto-catalog to Firebase\n"
+                f"• `/dl <firebase_key>` — Get Direct Download buttons for any cataloged movie\n"
+                f"• `/status` — Bot, Firebase, TMDB & Koyeb server health\n"
+                f"• `/inspectdb` — Check Firebase nodes, movie count & APK schema types\n"
+                f"• `/addadmin <user_id>` (or reply) — Authorize an admin\n"
+                f"• `/removeadmin <user_id>` (or reply) — Revoke an admin\n"
+                f"• `/admins` or `/adminlist` — List authorized admins",
+                quote=True,
+            )
+            return
+
         await message.reply_text(
-            f"🎬 **Movie & File Catalog Bot**\n"
-            f"Your Role: **{role}** (`{uid}`)\n\n"
-            f"**Admin Commands:**\n"
-            f"• Send or forward any video/document file or link to auto-catalog to Firebase\n"
-            f"• `/status` — Bot, Firebase, TMDB & Koyeb server health\n"
-            f"• `/inspectdb` — Check Firebase nodes, movie count & APK schema types\n"
-            f"• `/addadmin <user_id>` (or reply) — Authorize an admin\n"
-            f"• `/removeadmin <user_id>` (or reply) — Revoke an admin\n"
-            f"• `/admins` or `/adminlist` — List authorized admins",
+            "🎬 **SPY MOVIE BOTZ**\n"
+            "Open any movie link from our channel or APK to receive **Direct Download** and **Watch Online** buttons.",
             quote=True,
         )
+
+    @app.on_message(filters.command(["dl"]))
+    async def cmd_direct_download(client: Client, message: Message) -> None:
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) < 2 or not args[1].strip():
+            await message.reply_text("Usage: `/dl <firebase_key>`", quote=True)
+            return
+        await _send_user_download_card(message, args[1].strip())
 
     # ------------------------------------------------------------------
     # /inspectdb
@@ -702,6 +824,7 @@ def register_handlers(
             file_id=file_id,
             message_id=storage_msg_id,
             direct_url=direct_url,
+            file_name=raw_filename,
             send_confirmation=not silent_channel_mode,
         )
 
@@ -738,7 +861,7 @@ def register_handlers(
 
     @app.on_message(
         filters.text
-        & ~filters.command(["start", "help", "status", "inspectdb", "addadmin", "removeadmin", "admins", "adminlist"])
+        & ~filters.command(["start", "help", "dl", "status", "inspectdb", "addadmin", "removeadmin", "admins", "adminlist"])
     )
     async def handle_link_upload(client: Client, message: Message) -> None:
         text = (message.text or "").strip()
@@ -878,6 +1001,10 @@ def register_handlers(
                     "download780": download_url if new_value == "720p" else "",
                     "download1080": download_url if new_value in ("1080p", "4K") else "",
                 }
+                if "download720" in existing:
+                    patch["download720"] = download_url if new_value == "720p" else ""
+                if "watch720" in existing:
+                    patch["watch720"] = watch_url if new_value == "720p" else ""
 
             try:
                 await firebase.update_movie(firebase_key, patch)
@@ -888,7 +1015,11 @@ def register_handlers(
             updated = {**existing, **patch}
             await query.answer(f"Updated to {new_value}")
             new_text = _format_confirmation_text(updated, firebase_key, True)
-            new_markup = _build_post_save_keyboard(firebase_key, updated.get("watchLink", ""))
+            new_markup = _build_post_save_keyboard(
+                firebase_key,
+                updated.get("watchLink", ""),
+                updated.get("downloadLink", ""),
+            )
             if query.message.photo:
                 await query.message.edit_caption(caption=new_text[:1024], reply_markup=new_markup)
             else:

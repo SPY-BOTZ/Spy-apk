@@ -4,7 +4,9 @@ import parserPy from '../../telegram-movie-bot/bot/parser.py?raw';
 import tmdbClientPy from '../../telegram-movie-bot/bot/tmdb_client.py?raw';
 import firebaseClientPy from '../../telegram-movie-bot/bot/firebase_client.py?raw';
 import webServerPy from '../../telegram-movie-bot/bot/web_server.py?raw';
+import streamerPy from '../../telegram-movie-bot/bot/streamer.py?raw';
 import handlersPy from '../../telegram-movie-bot/bot/handlers.py?raw';
+import linkGeneratorPy from '../../telegram-movie-bot/bot/link_generator.py?raw';
 import initPy from '../../telegram-movie-bot/bot/__init__.py?raw';
 import testBotPy from '../../telegram-movie-bot/tests/test_bot.py?raw';
 import requirementsTxt from '../../telegram-movie-bot/requirements.txt?raw';
@@ -65,12 +67,28 @@ export const BOT_FILES: BotFileEntry[] = [
     content: firebaseClientPy,
   },
   {
+    path: 'bot/link_generator.py',
+    name: 'link_generator.py',
+    folder: 'bot',
+    language: 'python',
+    summary: 'HMAC-signed speed-optimized Direct Download link generator',
+    content: linkGeneratorPy,
+  },
+  {
     path: 'bot/web_server.py',
     name: 'web_server.py',
     folder: 'bot',
     language: 'python',
-    summary: 'Koyeb aiohttp health endpoints and HTTP Range media streamer',
+    summary: 'Koyeb aiohttp health endpoints, branded player, and parallel range streamer',
     content: webServerPy,
+  },
+  {
+    path: 'bot/streamer.py',
+    name: 'streamer.py',
+    folder: 'bot',
+    language: 'python',
+    summary: 'High-speed parallel Telegram MTProto ByteStreamer with persistent DC sessions',
+    content: streamerPy,
   },
   {
     path: 'bot/handlers.py',

@@ -10,35 +10,57 @@ import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import quote
 
 from aiohttp import web
 
+from bot.streamer import FastByteStreamer
+
 if TYPE_CHECKING:
     from pyrogram import Client
+    from bot.link_generator import SpeedLinkGenerator
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_CHUNK_SIZE = 1024 * 1024  # Pyrogram stream_media yields 1 MiB chunks
-PREFETCH_QUEUE_CHUNKS = 8
+TELEGRAM_CHUNK_SIZE = 1024 * 1024  # Fallback Pyrogram stream_media chunk size (1 MiB)
+MESSAGE_CACHE_TTL_SECONDS = 900
+TELEGRAM_CHANNEL_URL = "https://t.me/Prime_Movie_YT_Group"
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+_EXT_MIME_MAP = {
+    ".mkv": "video/x-matroska",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".ts": "video/mp2t",
+    ".flv": "video/x-flv",
+    ".3gp": "video/3gpp",
+}
 
 LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "spy_movie_botz_logo.png"
 
 
-def _extract_media_meta(message: Any) -> tuple[Optional[str], int, str]:
-    """Return `(file_name, file_size, mime_type)` for a Pyrogram message."""
+def _extract_media_meta(message: Any) -> tuple[Optional[str], int, str, str]:
+    """Return `(file_name, file_size, mime_type, file_id)` for a Pyrogram message."""
     media = message.video or message.document or message.audio
     if not media:
-        return None, 0, "application/octet-stream"
+        return None, 0, "application/octet-stream", ""
 
     file_name = getattr(media, "file_name", None) or f"media_{message.id}.mp4"
     file_size = int(getattr(media, "file_size", 0) or 0)
-    mime_type = (
-        getattr(media, "mime_type", None)
-        or mimetypes.guess_type(file_name)[0]
-        or "video/mp4"
-    )
-    return file_name, file_size, mime_type
+    file_id = str(getattr(media, "file_id", "") or "")
+
+    raw_mime = str(getattr(media, "mime_type", None) or "").strip()
+    ext = Path(file_name).suffix.lower()
+    ext_mime = _EXT_MIME_MAP.get(ext) or mimetypes.guess_type(file_name)[0]
+    if raw_mime and raw_mime != "application/octet-stream":
+        mime_type = raw_mime
+    else:
+        mime_type = ext_mime or "video/mp4"
+
+    return file_name, file_size, mime_type, file_id
 
 
 def _format_size(size_bytes: int) -> str:
@@ -60,11 +82,15 @@ class BotWebServer:
         port: int,
         storage_channel_id: int,
         start_time: float,
+        link_generator: Optional["SpeedLinkGenerator"] = None,
     ) -> None:
         self._port = port
         self._storage_channel_id = storage_channel_id
         self._start_time = start_time
+        self._link_generator = link_generator
         self._tg_client: Optional["Client"] = None
+        self._streamer: Optional[FastByteStreamer] = None
+        self._msg_cache: dict[int, tuple[float, Any]] = {}
         self._app = web.Application()
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -72,6 +98,7 @@ class BotWebServer:
 
     def attach_telegram_client(self, client: "Client") -> None:
         self._tg_client = client
+        self._streamer = FastByteStreamer(client, self._storage_channel_id)
 
     def _register_routes(self) -> None:
         self._app.router.add_get("/", self.handle_root)
@@ -82,6 +109,10 @@ class BotWebServer:
         self._app.router.add_route("HEAD", "/stream/{message_id}", self.handle_stream)
         self._app.router.add_route("GET", "/download/{message_id}", self.handle_download)
         self._app.router.add_route("HEAD", "/download/{message_id}", self.handle_download)
+        self._app.router.add_route("GET", "/dl/{sig}/{message_id}", self.handle_signed_download)
+        self._app.router.add_route("HEAD", "/dl/{sig}/{message_id}", self.handle_signed_download)
+        self._app.router.add_route("GET", "/dl/{sig}/{message_id}/{filename}", self.handle_signed_download)
+        self._app.router.add_route("HEAD", "/dl/{sig}/{message_id}/{filename}", self.handle_signed_download)
 
     async def start(self) -> None:
         self._runner = web.AppRunner(self._app, access_log=None)
@@ -91,6 +122,9 @@ class BotWebServer:
         logger.info("HTTP server listening on 0.0.0.0:%d", self._port)
 
     async def stop(self) -> None:
+        if self._streamer is not None:
+            await self._streamer.close()
+            self._streamer = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -145,24 +179,36 @@ class BotWebServer:
             return web.json_response({"error": "Invalid message ID"}, status=400)
 
         msg_id = int(raw_id)
+        raw_file_name: Optional[str] = None
         safe_file_name = f"Stream #{msg_id}"
         size_label = ""
         if self._tg_client and getattr(self._tg_client, "is_connected", False):
             try:
-                msg = await self._tg_client.get_messages(self._storage_channel_id, msg_id)
-                file_name, file_size, _ = _extract_media_meta(msg)
-                if file_name:
-                    safe_file_name = html.escape(file_name)
-                if file_size > 0:
-                    size_label = _format_size(file_size)
+                msg = await self._get_cached_message(msg_id)
+                if msg:
+                    file_name, file_size, _, _ = _extract_media_meta(msg)
+                    if file_name:
+                        raw_file_name = file_name
+                        safe_file_name = html.escape(file_name)
+                    if file_size > 0:
+                        size_label = _format_size(file_size)
             except Exception as exc:
                 logger.debug("Could not fetch metadata for watch page %s: %s", msg_id, exc)
 
         scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
         host = request.headers.get("X-Forwarded-Host", request.host)
         stream_abs_url = f"{scheme}://{host}/stream/{msg_id}"
+        if self._link_generator:
+            speed_links = self._link_generator.generate(
+                message_id=msg_id,
+                file_name=raw_file_name,
+            )
+            direct_dl_path = f"/dl/{speed_links.signature}/{msg_id}/{speed_links.safe_filename}"
+        else:
+            direct_dl_path = f"/download/{msg_id}"
         vlc_url = f"vlc://{stream_abs_url}"
-        mx_url = f"intent:{stream_abs_url}#Intent;package=com.mxtech.videoplayer.ad;S.title={safe_file_name};end"
+        encoded_title = quote(raw_file_name or f"Stream {msg_id}")
+        mx_url = f"intent:{stream_abs_url}#Intent;package=com.mxtech.videoplayer.ad;S.title={encoded_title};end"
         meta_line = f"{safe_file_name} &middot; {size_label}" if size_label else safe_file_name
 
         page = f"""<!doctype html>
@@ -234,6 +280,22 @@ class BotWebServer:
       max-height: 72vh;
       background: #000000;
     }}
+    .player-error {{
+      display: none;
+      width: 100%;
+      margin-top: 10px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      color: #fcd34d;
+      font-size: 0.85rem;
+      line-height: 1.45;
+      text-align: center;
+    }}
+    .player-error.visible {{
+      display: block;
+    }}
     .actions {{
       width: 100%;
       display: flex;
@@ -299,6 +361,20 @@ class BotWebServer:
       font-size: 0.75rem;
       color: #64748b;
     }}
+    .btn-channel {{
+      width: 100%;
+      margin-top: 16px;
+      padding: 14px 20px;
+      background: #0088cc;
+      color: #ffffff;
+      font-size: 0.95rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      border-radius: 10px;
+    }}
+    .btn-channel:hover {{
+      background: #0077b5;
+    }}
   </style>
 </head>
 <body>
@@ -310,14 +386,17 @@ class BotWebServer:
     </div>
 
     <div class="player-shell">
-      <video controls playsinline preload="metadata" src="/stream/{msg_id}"></video>
+      <video id="videoPlayer" controls playsinline preload="metadata" src="/stream/{msg_id}"></video>
+    </div>
+
+    <div id="playerError" class="player-error">
+      Browser could not decode this video format directly (common for MKV/HEVC/EAC3 files). Please tap <strong>Open in VLC</strong>, <strong>Open in MX Player</strong>, or <strong>Direct Download</strong> below.
     </div>
 
     <div class="actions">
-      <a class="btn btn-primary" href="/download/{msg_id}">Fast Download</a>
+      <a class="btn btn-primary" href="{direct_dl_path}">Direct Download</a>
       <a class="btn btn-secondary" href="{vlc_url}">Open in VLC</a>
       <a class="btn btn-secondary" href="{mx_url}">Open in MX Player</a>
-      <button class="btn btn-secondary" type="button" id="copyBtn">Copy Stream Link</button>
     </div>
 
     <div class="notice-card">
@@ -332,32 +411,79 @@ class BotWebServer:
         This Service Is For Personal Use Only
       </p>
     </div>
+
+    <a class="btn btn-channel" href="{TELEGRAM_CHANNEL_URL}" target="_blank" rel="noopener noreferrer">JOIN TELEGRAM CHANNEL</a>
   </div>
 
   <script>
     (function () {{
-      var btn = document.getElementById('copyBtn');
-      if (!btn) return;
-      btn.addEventListener('click', function () {{
-        var url = {stream_abs_url!r};
-        if (navigator.clipboard && navigator.clipboard.writeText) {{
-          navigator.clipboard.writeText(url).then(function () {{
-            btn.textContent = 'Stream Link Copied';
-            setTimeout(function () {{ btn.textContent = 'Copy Stream Link'; }}, 1800);
-          }});
-        }}
-      }});
+      var video = document.getElementById('videoPlayer');
+      var errBox = document.getElementById('playerError');
+      if (video && errBox) {{
+        video.addEventListener('error', function () {{
+          errBox.classList.add('visible');
+        }});
+      }}
     }})();
   </script>
 </body>
 </html>"""
         return web.Response(text=page, content_type="text/html")
 
+    async def _get_cached_message(self, msg_id: int) -> Any:
+        """Cache storage channel Message metadata in RAM to accelerate parallel range requests."""
+        now = time.monotonic()
+        cached = self._msg_cache.get(msg_id)
+        if cached and (now - cached[0]) < MESSAGE_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        message = await self._tg_client.get_messages(self._storage_channel_id, msg_id)
+        if message and not getattr(message, "empty", False):
+            if len(self._msg_cache) >= 500:
+                oldest_key = min(self._msg_cache, key=lambda k: self._msg_cache[k][0])
+                self._msg_cache.pop(oldest_key, None)
+            self._msg_cache[msg_id] = (now, message)
+        return message
+
     async def handle_stream(self, request: web.Request) -> web.StreamResponse:
         return await self._serve_telegram_media(request, as_attachment=False)
 
     async def handle_download(self, request: web.Request) -> web.StreamResponse:
         return await self._serve_telegram_media(request, as_attachment=True)
+
+    async def handle_signed_download(self, request: web.Request) -> web.StreamResponse:
+        raw_id = request.match_info["message_id"]
+        sig = request.match_info.get("sig", "")
+        if not raw_id.isdigit():
+            return web.json_response({"error": "Invalid message ID"}, status=400)
+        if self._link_generator and not self._link_generator.verify(int(raw_id), sig):
+            return web.json_response({"error": "Invalid download signature"}, status=403)
+        return await self._serve_telegram_media(request, as_attachment=True)
+
+    async def _stream_via_pyrogram_fallback(
+        self,
+        *,
+        message: Any,
+        response: web.StreamResponse,
+        start_byte: int,
+        content_length: int,
+    ) -> None:
+        """Sequential Pyrogram stream_media fallback when direct DC streaming cannot start."""
+        start_chunk = start_byte // TELEGRAM_CHUNK_SIZE
+        first_chunk_skip = start_byte % TELEGRAM_CHUNK_SIZE
+        remaining = content_length
+
+        async for chunk in self._tg_client.stream_media(message, offset=start_chunk):
+            if not chunk or remaining <= 0:
+                break
+            if first_chunk_skip:
+                chunk = chunk[first_chunk_skip:]
+                first_chunk_skip = 0
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+            if chunk:
+                await response.write(chunk)
+                remaining -= len(chunk)
 
     async def _serve_telegram_media(
         self,
@@ -373,7 +499,7 @@ class BotWebServer:
         msg_id = int(raw_id)
 
         try:
-            message = await self._tg_client.get_messages(self._storage_channel_id, msg_id)
+            message = await self._get_cached_message(msg_id)
         except Exception as exc:
             logger.error("Failed to fetch message %s from storage channel: %s", msg_id, exc)
             return web.json_response({"error": "Failed to retrieve media"}, status=502)
@@ -381,7 +507,7 @@ class BotWebServer:
         if not message or getattr(message, "empty", False):
             return web.json_response({"error": "Media not found"}, status=404)
 
-        file_name, file_size, mime_type = _extract_media_meta(message)
+        file_name, file_size, mime_type, file_id = _extract_media_meta(message)
         if not file_name or file_size <= 0:
             return web.json_response({"error": "Message contains no streamable media"}, status=404)
 
@@ -434,62 +560,49 @@ class BotWebServer:
         response = web.StreamResponse(status=status_code, headers=headers)
         await response.prepare(request)
 
-        start_chunk = start_byte // TELEGRAM_CHUNK_SIZE
-        first_chunk_skip = start_byte % TELEGRAM_CHUNK_SIZE
-        remaining = content_length
-
-        chunk_queue: asyncio.Queue[Optional[bytes | BaseException]] = asyncio.Queue(
-            maxsize=PREFETCH_QUEUE_CHUNKS
-        )
-
-        async def _prefetch_producer() -> None:
-            cancelled = False
-            try:
-                async for chunk in self._tg_client.stream_media(message, offset=start_chunk):
-                    if not chunk:
-                        break
-                    await chunk_queue.put(chunk)
-            except asyncio.CancelledError:
-                cancelled = True
-                raise
-            except Exception as exc:
-                await chunk_queue.put(exc)
-            finally:
-                if not cancelled:
-                    await chunk_queue.put(None)
-
-        producer_task = asyncio.create_task(_prefetch_producer())
-
+        bytes_sent = 0
         try:
-            while remaining > 0:
-                item = await chunk_queue.get()
-                if item is None:
-                    break
-                if isinstance(item, BaseException):
-                    raise item
-                chunk = item
-                if first_chunk_skip:
-                    chunk = chunk[first_chunk_skip:]
-                    first_chunk_skip = 0
-                if len(chunk) > remaining:
-                    chunk = chunk[:remaining]
-                if chunk:
-                    await response.write(chunk)
-                    remaining -= len(chunk)
+            if self._streamer is not None and file_id:
+                try:
+                    async for chunk in self._streamer.stream_range(
+                        message=message,
+                        file_id=file_id,
+                        start_byte=start_byte,
+                        end_byte=end_byte,
+                    ):
+                        await response.write(chunk)
+                        bytes_sent += len(chunk)
+                except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+                    raise
+                except Exception as exc:
+                    if bytes_sent > 0:
+                        raise
+                    logger.warning(
+                        "FastByteStreamer fallback to Pyrogram stream_media for msg %s: %s",
+                        msg_id,
+                        exc,
+                    )
+                    await self._stream_via_pyrogram_fallback(
+                        message=message,
+                        response=response,
+                        start_byte=start_byte,
+                        content_length=content_length,
+                    )
+            else:
+                await self._stream_via_pyrogram_fallback(
+                    message=message,
+                    response=response,
+                    start_byte=start_byte,
+                    content_length=content_length,
+                )
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             logger.debug("Client disconnected during stream of message %s", msg_id)
         except Exception as exc:
             logger.error("Error streaming message %s: %s", msg_id, exc)
-        finally:
-            if not producer_task.done():
-                producer_task.cancel()
-                try:
-                    await producer_task
-                except (asyncio.CancelledError, Exception):
-                    pass
 
         try:
             await response.write_eof()
         except Exception:
             pass
         return response
+

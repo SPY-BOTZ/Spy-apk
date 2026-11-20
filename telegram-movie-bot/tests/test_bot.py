@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot.config import ConfigError, Settings
 from bot.firebase_client import FirebaseClient
+from bot.link_generator import SpeedLinkGenerator, sanitize_download_filename
 from bot.parser import extract_direct_url, extract_telegram_link, parse_media_metadata
 from bot.tmdb_client import TmdbClient, TmdbMetadata
 
@@ -146,6 +147,23 @@ class AsyncClientsTests(unittest.IsolatedAsyncioTestCase):
         removed = await fb.remove_admin(2002)
         self.assertTrue(removed)
         self.assertFalse(fb.is_admin(2002))
+
+
+class LinkGeneratorTests(unittest.TestCase):
+    def test_signed_direct_download_link_and_verification(self) -> None:
+        gen = SpeedLinkGenerator(
+            bot_token="123:token",
+            api_hash="hash_xyz",
+            base_url="https://bot.koyeb.app",
+        )
+        links = gen.generate(message_id=151, file_name="Black Doves S01E01 1080p.mkv")
+        self.assertEqual(links.watch_url, "https://bot.koyeb.app/watch/151")
+        self.assertTrue(links.direct_download_url.startswith(f"https://bot.koyeb.app/dl/{links.signature}/151/"))
+        self.assertTrue(links.direct_download_url.endswith("Black.Doves.S01E01.1080p.mkv"))
+        self.assertTrue(gen.verify(151, links.signature))
+        self.assertFalse(gen.verify(152, links.signature))
+        self.assertFalse(gen.verify(151, "tampered00000000"))
+        self.assertEqual(sanitize_download_filename("no_ext", 9), "no_ext.mp4")
 
 
 if __name__ == "__main__":

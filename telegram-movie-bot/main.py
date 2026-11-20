@@ -13,6 +13,7 @@ from pyrogram import Client
 from bot.config import ConfigError, Settings
 from bot.firebase_client import FirebaseClient
 from bot.handlers import register_handlers
+from bot.link_generator import SpeedLinkGenerator
 from bot.tmdb_client import TmdbClient
 from bot.web_server import BotWebServer
 
@@ -43,10 +44,16 @@ async def run_bot() -> None:
         api_key=settings.tmdb_api_key,
         fallback_poster_url=settings.fallback_poster_url,
     )
+    link_generator = SpeedLinkGenerator(
+        bot_token=settings.bot_token,
+        api_hash=settings.api_hash,
+        base_url=settings.base_url,
+    )
     web_server = BotWebServer(
         port=settings.port,
         storage_channel_id=settings.storage_channel_id,
         start_time=start_time,
+        link_generator=link_generator,
     )
 
     # Start HTTP server immediately so Koyeb health checks pass during Telegram handshake
@@ -72,6 +79,7 @@ async def run_bot() -> None:
         firebase=firebase,
         tmdb=tmdb,
         start_time=start_time,
+        link_generator=link_generator,
     )
     web_server.attach_telegram_client(tg_client)
 
