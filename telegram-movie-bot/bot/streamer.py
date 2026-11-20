@@ -17,10 +17,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Telegram requires limit to divide 1 MiB cleanly and offset % limit == 0.
-# 512 KiB chunks with 6 concurrent in-flight requests gives fast first-byte
-# latency for video seeking and high sustained throughput for downloads.
+# Start with 1 worker for instant first-byte & zero wasted metadata probes,
+# then ramp up to 4 concurrent 512 KiB workers for sustained fast downloads.
 STREAM_CHUNK_SIZE = 512 * 1024  # 512 KiB
-PARALLEL_CHUNK_WORKERS = 6
+PARALLEL_CHUNK_WORKERS = 4
 
 
 class FastByteStreamer:
@@ -39,20 +39,45 @@ class FastByteStreamer:
             self._dc_locks[dc_id] = lock
         return lock
 
-    async def _get_media_session(self, dc_id: int, force_recreate: bool = False) -> Session:
+    @staticmethod
+    def _is_session_alive(session: Session) -> bool:
+        if getattr(session, "connection", object()) is None:
+            return False
+        if hasattr(session, "is_connected") and not bool(getattr(session, "is_connected")):
+            return False
+        started = getattr(session, "is_started", True)
+        if hasattr(started, "is_set"):
+            return bool(started.is_set())
+        return bool(started)
+
+    async def _get_media_session(self, dc_id: int, failed_session: Optional[Session] = None) -> Session:
         lock = self._get_dc_lock(dc_id)
         async with lock:
+            # 1. Check our cached session first; only replace it if it's disconnected
+            #    or matches the exact session that failed.
             existing = self._dc_sessions.get(dc_id)
-            if existing is not None and not force_recreate:
-                if getattr(existing, "is_started", True):
+            if existing is not None and existing is not failed_session:
+                if self._is_session_alive(existing):
                     return existing
 
-            if existing is not None:
+            # 2. Reuse Pyrofork's built-in media_sessions[dc_id] if already established.
+            native_sessions = getattr(self._client, "media_sessions", None)
+            if isinstance(native_sessions, dict):
+                native = native_sessions.get(dc_id)
+                if (
+                    native is not None
+                    and native is not failed_session
+                    and self._is_session_alive(native)
+                ):
+                    self._dc_sessions[dc_id] = native
+                    return native
+
+            if existing is not None and existing is failed_session:
+                self._dc_sessions.pop(dc_id, None)
                 try:
                     await existing.stop()
                 except Exception:
                     pass
-                self._dc_sessions.pop(dc_id, None)
 
             storage_dc = await self._client.storage.dc_id()
             test_mode = await self._client.storage.test_mode()
@@ -81,6 +106,8 @@ class FastByteStreamer:
                 await session.start()
 
             self._dc_sessions[dc_id] = session
+            if isinstance(native_sessions, dict):
+                native_sessions[dc_id] = session
             logger.info("Initialized persistent media session for DC %d", dc_id)
             return session
 
@@ -125,10 +152,11 @@ class FastByteStreamer:
         state: dict[str, Any],
         offset: int,
     ) -> bytes:
+        failed_session: Optional[Session] = None
         for attempt in range(4):
             dc_id: int = state["dc_id"]
             location = state["location"]
-            session = await self._get_media_session(dc_id, force_recreate=(attempt > 0 and attempt == 2))
+            session = await self._get_media_session(dc_id, failed_session=failed_session)
             try:
                 res = await session.invoke(
                     raw.functions.upload.GetFile(
@@ -142,19 +170,25 @@ class FastByteStreamer:
             except FloodWait as exc:
                 await asyncio.sleep(min(float(exc.value), 10.0))
             except FileMigrate as exc:
-                state["dc_id"] = exc.value
+                async with state["lock"]:
+                    state["dc_id"] = exc.value
             except FileReferenceExpired:
-                new_file_id = await self._refresh_file_id(message_id)
-                if not new_file_id:
-                    raise
-                decoded, new_loc = self._build_location(new_file_id)
-                state["dc_id"] = decoded.dc_id
-                state["location"] = new_loc
+                async with state["lock"]:
+                    new_file_id = await self._refresh_file_id(message_id)
+                    if not new_file_id:
+                        raise
+                    decoded, new_loc = self._build_location(new_file_id)
+                    state["dc_id"] = decoded.dc_id
+                    state["location"] = new_loc
             except Exception as exc:
                 if attempt == 3:
                     raise
+                # Only mark session failed on repeated errors so transient chunk timeouts
+                # don't kill a healthy session for other parallel workers.
+                if attempt >= 1 and not self._is_session_alive(session):
+                    failed_session = session
                 logger.debug("Retrying GetFile offset=%d on DC %d (%s)", offset, dc_id, exc)
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.35 * (attempt + 1))
         return b""
 
     async def stream_range(
@@ -165,7 +199,7 @@ class FastByteStreamer:
         start_byte: int,
         end_byte: int,
     ) -> AsyncIterator[bytes]:
-        """Yield exact byte slice `[start_byte, end_byte]` in order using parallel chunk fetches."""
+        """Yield exact byte slice `[start_byte, end_byte]` in order with ramp-up concurrency."""
         if not file_id:
             return
 
@@ -173,6 +207,7 @@ class FastByteStreamer:
         state: dict[str, Any] = {
             "dc_id": decoded.dc_id,
             "location": location,
+            "lock": asyncio.Lock(),
         }
 
         first_chunk_idx = start_byte // STREAM_CHUNK_SIZE
@@ -183,11 +218,11 @@ class FastByteStreamer:
         next_to_schedule = first_chunk_idx
         in_flight: dict[int, asyncio.Task[bytes]] = {}
 
-        def _schedule_more() -> None:
+        def _schedule_more(max_workers: int) -> None:
             nonlocal next_to_schedule
             while (
                 next_to_schedule <= last_chunk_idx
-                and len(in_flight) < PARALLEL_CHUNK_WORKERS
+                and len(in_flight) < max_workers
             ):
                 idx = next_to_schedule
                 next_to_schedule += 1
@@ -200,11 +235,12 @@ class FastByteStreamer:
                 )
 
         try:
-            _schedule_more()
+            # Start with 1 worker for instant TTFB and clean metadata probes;
+            # ramp up to PARALLEL_CHUNK_WORKERS once chunk 0 has been yielded.
+            _schedule_more(1)
             for idx in range(first_chunk_idx, last_chunk_idx + 1):
                 task = in_flight.pop(idx)
                 chunk = await task
-                _schedule_more()
 
                 if not chunk:
                     break
@@ -217,9 +253,11 @@ class FastByteStreamer:
                     remaining -= len(chunk)
                 if remaining <= 0:
                     break
+                _schedule_more(PARALLEL_CHUNK_WORKERS)
         finally:
             for pending_task in in_flight.values():
                 if not pending_task.done():
                     pending_task.cancel()
             if in_flight:
                 await asyncio.gather(*in_flight.values(), return_exceptions=True)
+
