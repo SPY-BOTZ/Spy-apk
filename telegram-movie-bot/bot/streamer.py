@@ -21,12 +21,67 @@ logger = logging.getLogger(__name__)
 # then ramp up to 4 concurrent 512 KiB workers for sustained fast downloads.
 STREAM_CHUNK_SIZE = 512 * 1024  # 512 KiB
 PARALLEL_CHUNK_WORKERS = 4
+_SESSION_RESTART_GUARDED = False
+
+
+def install_pyrogram_session_guard() -> None:
+    """Prevent concurrent Session.restart() calls from racing on asyncio StreamReader.read()."""
+    global _SESSION_RESTART_GUARDED
+    if _SESSION_RESTART_GUARDED:
+        return
+    original_restart = Session.restart
+
+    async def _guarded_restart(self: Session) -> None:
+        if getattr(self, "_retired", False):
+            return
+        lock = getattr(self, "_restart_guard_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(self, "_restart_guard_lock", lock)
+        if lock.locked():
+            return
+        async with lock:
+            if getattr(self, "_retired", False):
+                return
+            try:
+                await original_restart(self)
+            except RuntimeError as exc:
+                if "already waiting" in str(exc):
+                    logger.debug(
+                        "Suppressed concurrent Session.restart() StreamReader race on DC %s",
+                        getattr(self, "dc_id", "?"),
+                    )
+                    setattr(self, "_retired", True)
+                else:
+                    raise
+
+    Session.restart = _guarded_restart  # type: ignore[method-assign]
+    _SESSION_RESTART_GUARDED = True
+
+
+async def _retire_and_stop_session(session: Session) -> None:
+    """Safely retire a DC session and cancel any dangling reader/ping tasks."""
+    setattr(session, "_retired", True)
+    try:
+        await asyncio.wait_for(session.stop(), timeout=3.0)
+    except Exception:
+        conn = getattr(session, "connection", None)
+        if conn is not None:
+            try:
+                await asyncio.wait_for(conn.close(), timeout=1.0)
+            except Exception:
+                pass
+        for task_attr in ("recv_task", "ping_task"):
+            task = getattr(session, task_attr, None)
+            if task is not None and hasattr(task, "done") and not task.done():
+                task.cancel()
 
 
 class FastByteStreamer:
     """Streams Telegram media using parallel `upload.GetFile` calls over pooled DC sessions."""
 
     def __init__(self, client: "Client", storage_channel_id: int) -> None:
+        install_pyrogram_session_guard()
         self._client = client
         self._storage_channel_id = storage_channel_id
         self._dc_sessions: dict[int, Session] = {}
@@ -41,9 +96,14 @@ class FastByteStreamer:
 
     @staticmethod
     def _is_session_alive(session: Session) -> bool:
+        if getattr(session, "_retired", False):
+            return False
         if getattr(session, "connection", object()) is None:
             return False
         if hasattr(session, "is_connected") and not bool(getattr(session, "is_connected")):
+            return False
+        recv_task = getattr(session, "recv_task", None)
+        if recv_task is not None and hasattr(recv_task, "done") and recv_task.done():
             return False
         started = getattr(session, "is_started", True)
         if hasattr(started, "is_set"):
@@ -53,31 +113,16 @@ class FastByteStreamer:
     async def _get_media_session(self, dc_id: int, failed_session: Optional[Session] = None) -> Session:
         lock = self._get_dc_lock(dc_id)
         async with lock:
-            # 1. Check our cached session first; only replace it if it's disconnected
-            #    or matches the exact session that failed.
             existing = self._dc_sessions.get(dc_id)
             if existing is not None and existing is not failed_session:
                 if self._is_session_alive(existing):
                     return existing
 
-            # 2. Reuse Pyrofork's built-in media_sessions[dc_id] if already established.
-            native_sessions = getattr(self._client, "media_sessions", None)
-            if isinstance(native_sessions, dict):
-                native = native_sessions.get(dc_id)
-                if (
-                    native is not None
-                    and native is not failed_session
-                    and self._is_session_alive(native)
-                ):
-                    self._dc_sessions[dc_id] = native
-                    return native
-
-            if existing is not None and existing is failed_session:
+            # Always retire and clean up any dead or failed session before creating a new one
+            # so background ping/recv tasks don't leak or trigger StreamReader collisions.
+            if existing is not None:
                 self._dc_sessions.pop(dc_id, None)
-                try:
-                    await existing.stop()
-                except Exception:
-                    pass
+                await _retire_and_stop_session(existing)
 
             storage_dc = await self._client.storage.dc_id()
             test_mode = await self._client.storage.test_mode()
@@ -106,18 +151,13 @@ class FastByteStreamer:
                 await session.start()
 
             self._dc_sessions[dc_id] = session
-            if isinstance(native_sessions, dict):
-                native_sessions[dc_id] = session
             logger.info("Initialized persistent media session for DC %d", dc_id)
             return session
 
     async def close(self) -> None:
         for dc_id, session in list(self._dc_sessions.items()):
-            try:
-                await session.stop()
-            except Exception:
-                pass
             self._dc_sessions.pop(dc_id, None)
+            await _retire_and_stop_session(session)
 
     @staticmethod
     def _build_location(file_id: str) -> tuple[FileId, Any]:

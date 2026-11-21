@@ -14,6 +14,7 @@ from bot.config import ConfigError, Settings
 from bot.firebase_client import FirebaseClient
 from bot.handlers import register_handlers
 from bot.link_generator import SpeedLinkGenerator
+from bot.streamer import install_pyrogram_session_guard
 from bot.tmdb_client import TmdbClient
 from bot.web_server import BotWebServer
 
@@ -27,6 +28,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
 async def run_bot() -> None:
+    install_pyrogram_session_guard()
     start_time = time.monotonic()
 
     try:
